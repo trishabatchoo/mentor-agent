@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Private prompts
+prompts/
+
+# Private student data and transcripts
+data/students.json
+fixtures/private/
+
+# Private/proprietary reference material
+references/
+references/**/*.pdf
+
+# Generated output and logs
+logs/
+outputs/
+*.log
+
+# macOS and editor files
+.DS_Store
+.vscode/

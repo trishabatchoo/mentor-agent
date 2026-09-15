@@ -1,0 +1,120 @@
+EDITED AND ANONYMIZED MENTORING TRANSCRIPT
+
+Case-study note: This sample has been condensed and lightly reconstructed from an
+automatically generated transcript. Names, dates, scheduling details, personal
+conversation, and identifying program information have been removed. Repetition,
+false starts, screen-navigation chatter, and transcription errors were edited for
+clarity. It should be treated as a representative workflow example, not a verbatim
+record.
+
+Participants
+- MENTOR
+- STUDENT
+
+Context
+- Data analysis apprenticeship
+- Current work: importing, inspecting, and mapping several datasets in Google Colab
+
+---
+
+MENTOR: Last time, we started getting familiar with the Colab notebook, but an
+outage prevented us from going through everything. Were you able to continue
+working on it?
+
+STUDENT: I met with some other apprentices and helped a few people catch up. I
+didn't have time to move forward with my own notebook, so I haven't completed
+anything new since our last session.
+
+MENTOR: That's okay. Most of the next steps happen in Colab, so let's work through
+some of them together.
+
+MENTOR: The notebook cells need to be run in order because later cells depend on
+the libraries, files, and variables loaded earlier. You can run them individually
+from top to bottom or use "Run all."
+
+MENTOR: We also connected the notebook to Google Drive. You can upload files
+directly into Colab, but you may need to upload them again when the runtime resets.
+Keeping the files in Drive gives the notebook a persistent location from which to
+load them.
+
+STUDENT: For the source-data section, should I add links to the Excel files or the
+websites where I found the data?
+
+MENTOR: Add the original source URLs—the locations where you obtained the data.
+Separately, upload the downloaded files to Drive so the notebook can access them.
+
+MENTOR: Once a file is loaded into a pandas DataFrame, use simple exploratory
+commands to become familiar with it. For example, `head()` displays the first five
+rows, `unique()` shows the distinct values in a column, and `value_counts()` shows
+how frequently values occur.
+
+MENTOR: Column names must match exactly. If a column name contains spaces, select
+it with bracket notation and quotes, such as `df["Area Code"]`, rather than dot
+notation.
+
+STUDENT: Do I need to do that exploration for every file?
+
+MENTOR: Yes. Load and briefly inspect each of the six datasets. Once you have done
+one, the process should be similar for the other five.
+
+STUDENT: I currently have only three files, and I am confused about the mapping
+files. I thought one download contained everything.
+
+MENTOR: There are six files in total. Two of them sound similar but serve different
+purposes: one maps country identifiers used by the source data, while another maps
+countries to geographic regions. They come from different sources and should
+become two separate DataFrames.
+
+STUDENT: So the country-identifier mapping and the country-to-region mapping are
+separate files?
+
+MENTOR: Correct. One contains the source-specific country codes. The other adds
+region information. You will eventually join them using a column they share.
+
+STUDENT: I also downloaded a ZIP archive and wasn't sure which file inside it I
+needed.
+
+MENTOR: Open the archive and select the table containing the country identifiers
+required by the assignment. For the separate country-to-region mapping, use the
+resource linked in the course instructions. We'll verify both files once they are
+loaded.
+
+STUDENT: The notebook also shows a file-not-found error. Do I need to import the
+files I created in Excel?
+
+MENTOR: Yes. The notebook cannot read a local file until you upload it or make it
+available through Drive. I recommend placing all six files in one Drive folder,
+connecting Drive to Colab, and updating each notebook path to point to that folder.
+That will prevent you from having to upload the files again every time the runtime
+resets.
+
+STUDENT: The assignment also shows boxes connected by lines. Do I need to create
+that diagram myself?
+
+MENTOR: Yes. Create a simple diagram with one box for each dataset and connect the
+datasets that share a column. The assignment does not require a particular diagram
+tool, so you can use whichever one is easiest. The purpose is to show how the six
+datasets relate before you join them.
+
+STUDENT: Okay. I think I understand now: download all six files, put them in Drive,
+load them into the notebook, and inspect each one. Then I can work on the mappings
+and diagram.
+
+MENTOR: Exactly. Before our next session:
+
+1. Confirm that you have all six datasets.
+2. Store them together in Google Drive.
+3. Connect the notebook to Drive and correct the file paths.
+4. Load each dataset into a DataFrame.
+5. Inspect each dataset with commands such as `head()`, `unique()`, or
+   `value_counts()`.
+6. Identify the shared columns that will connect the datasets in the mapping
+   diagram.
+
+If you get stuck, note the error and the step that produced it so we can troubleshoot
+it next time.
+
+STUDENT: That makes sense. I'll work through those steps before the next session.
+
+MENTOR: Great. We'll review what loaded successfully, resolve any errors, and then
+continue with the joins.
