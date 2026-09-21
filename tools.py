@@ -1,24 +1,41 @@
+"""Tool schemas and implementations for the mentor agent.
+
+Two tools are exposed to the model: `get_student_context` (student record
+lookup) and `get_path_context` (learning-path reference retrieval). They
+are kept separate because the second call depends on data returned by the
+first -- the model reads a student's path from get_student_context, then
+requests that path's guide from get_path_context.
+"""
+
 import json
+import os
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent
-STUDENTS_PATH = PROJECT_DIR / "data" / "students.json"
-PATH_REFERENCES_DIR = PROJECT_DIR / "references" / "paths"
 
-PATH_FILES = {
-    "Application Developer Apprenticeship":
-        "application-development-apprenticeship.md",
-    "Application Developer Skills Bootcamp":
-        "application-developer-skills-bootcamp.md",
-    "Data Analyst Apprenticeship":
-        "data-analyst-apprenticeship.md",
-    "Data Visualization with Power BI":
-        "data-viz-power-bi.md",
-}
+STUDENTS_PATH = PROJECT_DIR / "data" / "students.example.json"
+
+PATH_REFERENCES_DIR= Path(
+    os.environ.get(
+        "REFERENCE_ROOT",
+        PROJECT_DIR / "references" / "example",
+    )
+)
+
+
+PATH_INDEX_PATH = PATH_REFERENCES_DIR / "path_index.json"
+
+# Maps a learning path's display name (as used in student records and
+# tool calls) to its reference guide's filename.
+PATH_FILES = json.loads(
+    PATH_INDEX_PATH.read_text(encoding="utf-8")
+)
+
 
 def load_students() -> dict:
-    with open(STUDENTS_PATH, "r", encoding="utf-8") as file:
-        return json.load(file)
+    """Load the local student record store."""
+    return json.loads(STUDENTS_PATH.read_text(encoding="utf-8"))
+
 
 TOOLS = [
     {
@@ -59,10 +76,18 @@ TOOLS = [
 
 
 def get_student_context(name: str) -> dict | None:
+    """Look up a student's stored context by name, or None if not found."""
     students = load_students()
     return students.get(name.strip())
 
-def get_path_context(path: str) -> dict:
+
+def get_path_context(path: str) -> dict[str, str]:
+    """Return the complete Markdown reference guide for a learning path.
+
+    This intentionally returns the whole guide rather than a targeted
+    excerpt -- the model is expected to locate the section relevant to
+    the student's current project itself. See README for rationale.
+    """
     if path not in PATH_FILES:
         raise ValueError(
             f"Path name not recognized. "
@@ -70,9 +95,7 @@ def get_path_context(path: str) -> dict:
         )
 
     file_path = PATH_REFERENCES_DIR / PATH_FILES[path]
-
-    with open(file_path, "r", encoding="utf-8") as file:
-        reference_content = file.read()
+    reference_content = file_path.read_text(encoding="utf-8")
 
     return {
         "path": path,
@@ -80,7 +103,8 @@ def get_path_context(path: str) -> dict:
     }
 
 
-def execute_tool(tool_name: str, tool_input: dict):
+def execute_tool(tool_name: str, tool_input: dict) -> dict | None:
+    """Dispatch a tool_use request by name to its implementation."""
     if tool_name == "get_student_context":
         return get_student_context(tool_input["name"])
 

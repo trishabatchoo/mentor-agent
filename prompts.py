@@ -1,6 +1,8 @@
+"""Loads system instructions from local, gitignored prompt files."""
+
 from pathlib import Path
 
-PROMPTS_DIR = Path(__file__).parent / "prompts"
+PROMPTS_DIR = Path(__file__).parent / "prompts" / "example"
 
 _MODE_FILES = {
     "pre_session": "pre_session.md",
@@ -10,11 +12,13 @@ _MODE_FILES = {
 
 
 def load_prompt(filename: str) -> str:
+    """Read a single prompt file from the prompts directory."""
     path = PROMPTS_DIR / filename
     return path.read_text(encoding="utf-8")
 
 
 def build_instructions(mode: str) -> str:
+    """Combine the shared instructions with mode-specific instructions."""
     if mode not in _MODE_FILES:
         raise ValueError(f"Unknown mode: {mode}")
 

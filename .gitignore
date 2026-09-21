@@ -8,15 +8,14 @@ __pycache__/
 *.py[cod]
 
 # Private prompts
-prompts/
+prompts/local/
 
 # Private student data and transcripts
-data/students.json
+data/students.local.json
 fixtures/private/
 
 # Private/proprietary reference material
-references/
-references/**/*.pdf
+references/local/
 
 # Generated output and logs
 logs/

@@ -1,0 +1,21 @@
+{
+  "Jordan": {
+    "path": "Data Analytics Foundations",
+    "current_project": "Project 2",
+    "session_length_minutes": 45,
+    "learning_preferences": [
+      "Benefits from concrete examples",
+      "Likes to summarize the workflow before implementing it"
+    ],
+    "previous_session": {
+      "topics": [
+        "Locating the required datasets",
+        "Connecting cloud storage to the notebook"
+      ],
+      "action_items": [
+        "Collect the remaining datasets",
+        "Load each dataset into a separate DataFrame"
+      ]
+    }
+  }
+}
