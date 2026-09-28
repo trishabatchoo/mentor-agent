@@ -38,8 +38,9 @@ The second tool call depends on information returned by the first, allowing the 
 
 ```text
 mentor-agent/
+├── run.py            # Profile-based launcher (example / local)
 ├── agent.py          # Agent loop and Anthropic API calls
-├── main.py           # Local entry point
+├── main.py           # Entry point (reads its config from the environment)
 ├── prompts.py        # Prompt loading and request construction
 ├── tools.py          # Tool definitions and implementations
 ├── data/             # Local student data
@@ -107,13 +108,63 @@ Optionally specify a model:
 export ANTHROPIC_MODEL="your-model-name"
 ```
 
-Then run:
+## Running the Agent
+
+Run the agent through `run.py`, which selects a configuration **profile** and
+sets its environment variables before starting the agent loop:
 
 ```bash
-python3 main.py
+python3 run.py example
+python3 run.py local
 ```
 
+* **`example`** — the public, synthetic configuration committed to this repo:
+  `prompts/example/`, `data/students.example.json`, `references/example/`,
+  and `fixtures/example/post_session_transcript.txt`. Defaults to student
+  `Jordan`, that transcript, and session date/time
+  `September 8, 2026 11:00 AM ET`.
+* **`local`** — a private, gitignored configuration for real use:
+  `prompts/local/`, `data/students.local.json`, `references/local/`, and a
+  transcript of your choosing (conventionally under `fixtures/private/`).
+  There are no defaults for this profile — the student, transcript, and
+  session date/time must all be supplied explicitly:
+
+  ```bash
+  python3 run.py local \
+    --student Amya \
+    --transcript fixtures/private/amya-september-8.txt \
+    --session-datetime "September 8, 2026 11:00 AM ET"
+  ```
+
+  `--transcript` may be a path relative to the project root (as above) or
+  an absolute path; relative paths are resolved against the project
+  directory regardless of your current working directory.
+
+  Each of `--student`, `--transcript`, and `--session-datetime` can
+  instead be supplied via the environment (`MENTOR_STUDENT_NAME`,
+  `TRANSCRIPT_PATH`, `SESSION_DATETIME`); the CLI flag always takes
+  precedence over the environment variable when both are set.
+
+`run.py` resolves and validates a profile's required files — including the
+transcript — before making any API call, and it never modifies
+`ANTHROPIC_API_KEY` or `ANTHROPIC_MODEL` — those always come from your
+shell's environment.
+
+You can still run `python3 main.py` directly; it uses the same environment
+variables (`PROMPTS_DIR`, `STUDENTS_DATA_PATH`, `REFERENCE_ROOT`,
+`TRANSCRIPT_PATH`, `MENTOR_STUDENT_NAME`, `SESSION_DATETIME`) and falls back
+to the public example defaults when they're unset.
+
 Running the program may make paid Anthropic API requests.
+
+### Local files are gitignored
+
+`prompts/local/`, `references/local/`, `data/students.local.json`, and
+`fixtures/private/` are excluded from version control (see `.gitignore`).
+They don't exist in a fresh checkout — create them yourself before running
+`python3 run.py local`. This keeps any real student data, transcripts, or
+proprietary reference material out of the repository while still letting the
+same codebase run against them locally.
 
 ## Privacy
 

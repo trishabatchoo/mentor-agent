@@ -1,8 +1,13 @@
 """Loads system instructions from local, gitignored prompt files."""
 
+import os
 from pathlib import Path
 
-PROMPTS_DIR = Path(__file__).parent / "prompts" / "example"
+PROJECT_DIR = Path(__file__).parent
+
+PROMPTS_DIR = Path(
+    os.environ.get("PROMPTS_DIR", PROJECT_DIR / "prompts" / "example")
+)
 
 _MODE_FILES = {
     "pre_session": "pre_session.md",
