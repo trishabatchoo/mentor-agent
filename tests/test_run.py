@@ -31,9 +31,23 @@ class EnvironmentIsolationMixin:
     need this.
     """
 
+    # Keys run.py's profile resolution reads or writes. Cleared at the
+    # start of every test so a developer's real shell exports (e.g. a
+    # locally-set MENTOR_STUDENT_NAME) can't change test outcomes.
+    _MANAGED_ENV_KEYS = (
+        "MENTOR_STUDENT_NAME",
+        "TRANSCRIPT_PATH",
+        "SESSION_DATETIME",
+        "PROMPTS_DIR",
+        "STUDENTS_DATA_PATH",
+        "REFERENCE_ROOT",
+    )
+
     def setUp(self):
         super().setUp()
         self._env_snapshot = dict(os.environ)
+        for key in self._MANAGED_ENV_KEYS:
+            os.environ.pop(key, None)
         self._had_main_module = "main" in sys.modules
         self._main_module_snapshot = sys.modules.get("main")
 
@@ -227,7 +241,7 @@ class ValidateProfileFilesTests(unittest.TestCase):
 
 class ApplyProfileEnvTests(unittest.TestCase):
     def test_example_profile_sets_expected_keys(self):
-        env = {"ANTHROPIC_API_KEY": "sk-should-not-move", "UNRELATED": "kept"}
+        env = {"ANTHROPIC_API_KEY": "test-api-key-sentinel", "UNRELATED": "kept"}
         transcript_path = run.PROJECT_DIR / run.DEFAULT_TRANSCRIPT_PATH
         run.apply_profile_env(
             "example", "Jordan", transcript_path, run.DEFAULT_SESSION_DATETIME, env
@@ -242,7 +256,7 @@ class ApplyProfileEnvTests(unittest.TestCase):
         self.assertEqual(env["TRANSCRIPT_PATH"], str(transcript_path))
         self.assertEqual(env["SESSION_DATETIME"], run.DEFAULT_SESSION_DATETIME)
         # Parent-shell secrets and unrelated vars must survive untouched.
-        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-should-not-move")
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "test-api-key-sentinel")
         self.assertEqual(env["UNRELATED"], "kept")
 
     def test_local_profile_sets_expected_keys(self):
@@ -367,9 +381,9 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_missing_files_exit_before_touching_app(self):
-        # The 'local' profile's transcript (fixtures/private/...) is
-        # gitignored and not expected to exist in this checkout, so this
-        # should fail validation before the app ever runs.
+        # An unmistakably nonexistent transcript path, so this test's
+        # outcome doesn't depend on whether a real private transcript
+        # happens to exist locally.
         calls = self._install_fake_app_main()
         with redirect_stderr(io.StringIO()) as stderr:
             with self.assertRaises(SystemExit) as ctx:
@@ -379,7 +393,7 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
                         "--student",
                         "Amya",
                         "--transcript",
-                        "fixtures/private/amya-september-8.txt",
+                        "fixtures/private/definitely-does-not-exist-test-transcript.txt",
                         "--session-datetime",
                         "September 8, 2026 11:00 AM ET",
                     ]
@@ -390,11 +404,11 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
 
     def test_parent_env_secrets_survive_a_full_run(self):
         calls = self._install_fake_app_main()
-        os.environ["ANTHROPIC_API_KEY"] = "sk-test-sentinel"
+        os.environ["ANTHROPIC_API_KEY"] = "test-api-key-sentinel"
         os.environ["ANTHROPIC_MODEL"] = "model-sentinel"
         run.main(["example"])
 
-        self.assertEqual(calls[0]["ANTHROPIC_API_KEY"], "sk-test-sentinel")
+        self.assertEqual(calls[0]["ANTHROPIC_API_KEY"], "test-api-key-sentinel")
         self.assertEqual(calls[0]["ANTHROPIC_MODEL"], "model-sentinel")
 
 
