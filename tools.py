@@ -13,9 +13,11 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent
 
-STUDENTS_PATH = PROJECT_DIR / "data" / "students.example.json"
+STUDENTS_PATH = Path(
+    os.environ.get("STUDENTS_DATA_PATH", PROJECT_DIR / "data" / "students.example.json")
+)
 
-PATH_REFERENCES_DIR= Path(
+PATH_REFERENCES_DIR = Path(
     os.environ.get(
         "REFERENCE_ROOT",
         PROJECT_DIR / "references" / "example",
