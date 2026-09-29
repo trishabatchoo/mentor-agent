@@ -1,11 +1,13 @@
 import json
 import logging
 import os
+import time
 from typing import Literal
 
 from anthropic import Anthropic
 from anthropic.types import Message
 
+from observability import RunTracer, text_sha256
 from prompts import build_instructions
 from tools import TOOLS, execute_tool
 
@@ -15,18 +17,11 @@ model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 api_key = os.environ["ANTHROPIC_API_KEY"]
 MAX_TURNS = 5
 
-# Characters of a tool result to show in terminal logs before truncating.
-# Display only -- the full result is still sent to the model untouched.
-LOG_TRUNCATE_CHARS = 300
-
 Mode = Literal["pre_session", "post_session", "new_student"]
 
 
-def _truncate_for_log(text: str, limit: int = LOG_TRUNCATE_CHARS) -> str:
-    """Shorten `text` for terminal display. Never used for API payloads."""
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}... ({len(text)} chars total)"
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 3)
 
 
 def run_agent(
@@ -34,8 +29,14 @@ def run_agent(
     mode: Mode,
     transcript: str | None = None,
     session_datetime: str | None = None,
+    student_id: str | None = None,
 ) -> Message:
     """Run the mentor agent loop and return the final Claude response.
+
+    `student_id` is an already-resolved, non-identifying id used only to
+    tag the run trace; it is never sent to the model. It is optional so
+    existing callers keep working, at the cost that omitting it silently
+    records student_id=null.
 
     `mode` is typed as a Literal for editor/type-checker support, but that
     hint is erased at runtime, so we still validate it explicitly below.
@@ -54,6 +55,38 @@ def run_agent(
             "Session date and time are required for post_session mode."
         )
 
+    # Tracing starts only once arguments are valid: invalid arguments are
+    # caller errors, not runs. Exceptions are recorded and re-raised
+    # unchanged; process-level signals (KeyboardInterrupt, SystemExit)
+    # are deliberately not caught.
+    tracer = RunTracer(mode=mode, model=model)
+    # Only post_session sends the transcript to the model, so only that
+    # mode records its size and fingerprint (null otherwise).
+    has_transcript = mode == "post_session"
+    tracer.run_started(
+        student_id=student_id,
+        transcript_char_count=len(transcript) if has_transcript else None,
+        transcript_sha256=text_sha256(transcript) if has_transcript else None,
+    )
+    try:
+        response = _run_loop(
+            student_name, mode, transcript, session_datetime, tracer
+        )
+    except Exception as exc:
+        tracer.run_failed(type(exc).__name__)
+        raise
+    tracer.run_completed()
+    return response
+
+
+def _run_loop(
+    student_name: str,
+    mode: Mode,
+    transcript: str | None,
+    session_datetime: str | None,
+    tracer: RunTracer,
+) -> Message:
+    """The agent loop proper. Called only by run_agent, after validation."""
     client = Anthropic()
     instructions = build_instructions(mode)
 
@@ -86,12 +119,25 @@ def run_agent(
         # System instructions and tool definitions are resent every call:
         # the Messages API is stateless, so each request must carry the
         # full context the model needs, not just the newest message.
-        response = client.messages.create(
-            model=model,
-            max_tokens=5000,
-            tools=TOOLS,
-            system=instructions,
-            messages=messages,
+        call_start = time.perf_counter()
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=5000,
+                tools=TOOLS,
+                system=instructions,
+                messages=messages,
+            )
+        except Exception:
+            tracer.mark_failure("api_error")
+            raise
+
+        tracer.model_response(
+            turn=turn + 1,
+            duration_ms=_elapsed_ms(call_start),
+            stop_reason=response.stop_reason,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
         )
 
         logger.info(
@@ -124,25 +170,45 @@ def run_agent(
                 if block.type == "tool_use":
                     logger.info("Executing tool: %s", block.name)
                     logger.debug("Tool use id: %s", block.id)
-                    logger.debug("Tool input: %s", block.input)
+                    # Field names only: tool input values and tool results
+                    # can contain student data and are never logged.
+                    logger.debug(
+                        "Tool input fields: %s",
+                        sorted(block.input) if isinstance(block.input, dict) else [],
+                    )
 
+                    tool_start = time.perf_counter()
                     try:
                         result = execute_tool(block.name, block.input)
-                    except Exception:
-                        logger.exception(
-                            "Tool %s failed for input %s",
+                    except Exception as exc:
+                        tracer.tool_execution(
+                            turn=turn + 1,
+                            tool_name=block.name,
+                            tool_use_id=block.id,
+                            duration_ms=_elapsed_ms(tool_start),
+                            error_type=type(exc).__name__,
+                        )
+                        tracer.mark_failure("tool_error")
+                        # Exception type only; its message may echo inputs.
+                        logger.error(
+                            "Tool %s failed (tool_use_id=%s): %s",
                             block.name,
-                            block.input,
+                            block.id,
+                            type(exc).__name__,
                         )
                         raise
 
+                    tracer.tool_execution(
+                        turn=turn + 1,
+                        tool_name=block.name,
+                        tool_use_id=block.id,
+                        duration_ms=_elapsed_ms(tool_start),
+                    )
+
                     result_json = json.dumps(result)
 
-                    # Only the logged preview is truncated for readability.
-                    # The full, untruncated result_json is what gets sent
-                    # to the model below
                     logger.info(
-                        "Tool result: %s", _truncate_for_log(result_json)
+                        "Tool %s returned %d chars", block.name, len(result_json)
                     )
 
                     tool_results.append(
@@ -164,6 +230,7 @@ def run_agent(
 
         if response.stop_reason == "max_tokens":
             logger.error("Claude reached max_tokens before finishing.")
+            tracer.mark_failure("max_tokens")
             raise RuntimeError(
                 "Claude reached max_tokens before finishing."
             )
@@ -177,6 +244,7 @@ def run_agent(
         )
 
     logger.error("Agent did not finish within %d turns.", MAX_TURNS)
+    tracer.mark_failure("max_turns")
     raise RuntimeError(
         f"Agent did not finish within {MAX_TURNS} turns."
     )

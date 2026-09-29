@@ -40,6 +40,7 @@ The second tool call depends on information returned by the first, allowing the 
 mentor-agent/
 ├── run.py            # Profile-based launcher (example / local)
 ├── agent.py          # Agent loop and Anthropic API calls
+├── observability.py  # Local structured run tracing (JSONL)
 ├── main.py           # Entry point (reads its config from the environment)
 ├── prompts.py        # Prompt loading and request construction
 ├── tools.py          # Tool definitions and implementations
@@ -80,6 +81,45 @@ On each turn, the loop:
 4. Executes requested tools when the model returns `tool_use`.
 5. Appends the assistant tool request and corresponding tool result to the message history.
 6. Continues until the model completes the task or reaches the maximum-turn limit.
+
+## Observability
+
+In addition to the human-readable terminal logs, every valid agent run appends
+structured events to `logs/agent-runs.jsonl` (gitignored). The file uses JSONL
+(newline-delimited JSON): each line is one complete JSON object describing a
+single event. Calls rejected by argument validation are not traced. All events
+from a run share a `run_id`, plus `timestamp`, `mode`, and `model`.
+
+| Event | Records |
+|---|---|
+| `run_started` | `student_id`, `transcript_char_count`, `transcript_sha256` |
+| `model_response` | turn, call duration, `stop_reason`, input/output tokens |
+| `tool_execution` | turn, tool name, `tool_use_id`, duration, `success`/`error`, error type |
+| `run_completed` | total duration, turns, token totals, tool calls |
+| `run_failed` | total duration, turns, token totals, tool calls, error type, `failure_reason` (`api_error`, `tool_error`, `max_tokens`, `max_turns`, `unexpected_error`) |
+
+Traces contain operational metadata only. Student names, transcript text or
+file paths, prompts, tool inputs and results, model responses, exception
+messages, and API keys are never recorded. Each event has a fixed allowlist of
+fields, so other data is dropped rather than written. `student_id` comes from
+the student record, and `transcript_sha256` is a fingerprint for telling
+whether two runs used the same transcript, not a security mechanism. Transcript
+fields are `null` outside `post_session` mode.
+
+Tracing never changes a run's outcome: if the log file can't be written, a
+single warning is emitted and the run continues.
+
+The examples below require [`jq`](https://jqlang.org/).
+
+```bash
+# Summarize recent runs
+jq -c 'select(.event == "run_completed" or .event == "run_failed")
+       | {run_id, status, turns, total_input_tokens, total_output_tokens, failure_reason}' \
+  logs/agent-runs.jsonl
+
+# Reconstruct one run's events in order
+jq 'select(.run_id == "YOUR_RUN_ID")' logs/agent-runs.jsonl
+```
 
 ## Setup
 
@@ -165,6 +205,11 @@ They don't exist in a fresh checkout — create them yourself before running
 `python3 run.py local`. This keeps any real student data, transcripts, or
 proprietary reference material out of the repository while still letting the
 same codebase run against them locally.
+
+Each student record should include a stable, non-identifying `student_id`
+(e.g. `"student_id": "student_007"`). It is used only to tag run traces in
+`logs/agent-runs.jsonl` and is removed from the context returned to the
+model. Records without one still run; their traces record `student_id: null`.
 
 ## Privacy
 
