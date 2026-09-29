@@ -78,9 +78,31 @@ TOOLS = [
 
 
 def get_student_context(name: str) -> dict | None:
-    """Look up a student's stored context by name, or None if not found."""
+    """Look up a student's stored context by name, or None if not found.
+
+    The record's student_id is a tracing identifier, not context for the
+    model, so it is removed from a copy of the record before returning.
+    """
     students = load_students()
-    return students.get(name.strip())
+    record = students.get(name.strip())
+    if record is None:
+        return None
+    context = record.copy()
+    context.pop("student_id", None)
+    return context
+
+
+def get_student_id(name: str) -> str | None:
+    """Return the explicit, non-identifying student_id stored in a
+    student's record, or None if the student or the field is missing.
+
+    Used only to tag run traces; never derived from the name.
+    """
+    record = load_students().get(name.strip())
+    if not isinstance(record, dict):
+        return None
+    student_id = record.get("student_id")
+    return student_id if isinstance(student_id, str) and student_id else None
 
 
 def get_path_context(path: str) -> dict[str, str]:

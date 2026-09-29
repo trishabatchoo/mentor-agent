@@ -1,5 +1,6 @@
 {
   "Jordan": {
+    "student_id": "example_student_001",
     "path": "Data Analytics Foundations",
     "current_project": "Project 2",
     "session_length_minutes": 45,
