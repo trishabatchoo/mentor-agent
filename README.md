@@ -14,7 +14,7 @@ The agent currently:
 * Loads shared and mode-specific instructions
 * Accepts runtime information such as a student name, transcript, and session date
 * Uses an agent loop that can handle multiple tool calls
-* Retrieves mock student context from local data
+* Retrieves student context and latest-session notes from local mock data (example profile) or, read-only, from Notion (local profile)
 * Retrieves a learning-path reference document
 * Uses retrieved context to produce a grounded response
 * Stops after a configurable maximum number of turns
@@ -43,7 +43,9 @@ mentor-agent/
 ├── observability.py  # Local structured run tracing (JSONL)
 ├── main.py           # Entry point (reads its config from the environment)
 ├── prompts.py        # Prompt loading and request construction
-├── tools.py          # Tool definitions and implementations
+├── tools.py          # Tool definitions and backend dispatch
+├── notion_client.py  # Read-only Notion HTTP client (auth, pagination)
+├── notion_repository.py # Notion page resolution, block traversal, sessions
 ├── data/             # Local student data
 ├── fixtures/         # Sanitized development inputs
 ├── prompts/          # Shared and mode-specific instructions
@@ -63,11 +65,72 @@ Retrieves a student’s current context, including:
 * Current project
 * Session length
 
+### `get_latest_session_notes`
+
+Retrieves the notes from the student's most recent previous session, with the
+session's date/time when available, or `latest_session: null` when there is
+none. Session transcripts are never retrieved.
+
 ### `get_path_context`
 
 Retrieves the complete reference document for a specified learning path.
 
 In this baseline version, the tool layer handles deterministic document selection while the model identifies and interprets the section relevant to the student’s current project.
+
+## Student Context Backends
+
+`get_student_context` and `get_latest_session_notes` read from a backend chosen
+explicitly by `STUDENT_CONTEXT_BACKEND`, which `run.py` sets per profile. The
+backend is never inferred from which credentials happen to be set, and a
+failing Notion backend never falls back to the JSON file.
+
+| Profile | Backend | Source |
+|---|---|---|
+| `example` | `json` | `data/students.example.json` (`get_latest_session_notes` returns the record's `previous_session`) |
+| `local` | `notion` | Pages under `NOTION_PARENT_PAGE_ID`, read-only |
+
+### Notion backend (read-only)
+
+Configuration comes from the environment, never from code:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `NOTION_API_KEY` | yes | Integration token |
+| `NOTION_PARENT_PAGE_ID` | yes | Page whose child pages are the student pages |
+| `NOTION_VERSION` | no | API version header, default `2026-03-11` |
+| `NOTION_MAX_TRAVERSAL_DEPTH` | no | Block nesting limit, default `6` |
+
+Behavior:
+
+* **Student page:** searches Notion by name, then requires exactly one page
+  whose title matches case-insensitively (whitespace-collapsed) and whose
+  parent is `NOTION_PARENT_PAGE_ID`. No match or multiple matches raise
+  `StudentNotFoundError` / `AmbiguousStudentMatchError`; fuzzy results are
+  never used.
+* **Student context:** the page's blocks rendered as text in document order
+  (headings, paragraphs, list items, to-dos, child-page titles, and nested
+  blocks), plus `path` and `current_project` parsed from lines such as
+  `Path: ...` and `Current project: ...` (`null` when absent). Child pages
+  (sessions) are not entered.
+* **Latest session:** the student page's child pages whose titles are
+  timezone-aware ISO timestamps (e.g. `2026-09-29T11:00:00.000-04:00`); the
+  latest by parsed datetime wins. Other titles, date-only and timezone-less
+  timestamps are ignored. No sessions yields `latest_session: null`.
+* **Session notes:** if the session contains a block labelled exactly `Notes`
+  (e.g. a tab), only its contents are returned; otherwise the whole page is.
+  Any block labelled `Transcript` is skipped without fetching its contents.
+  Nesting beyond the depth limit raises `TraversalDepthExceededError` rather
+  than truncating.
+* **Errors:** `NotionConfigError`, `NotionRequestError` (non-2xx or transport
+  failure; no retries), `MalformedNotionResponseError`, and the errors above.
+  Messages are fixed text with no names, ids, URLs, or content.
+* **Privacy:** Notion page and block ids are not included in tool results.
+  Terminal logs record only operation names, status categories, durations,
+  counts, and match/notes-found flags. The `httpx2` per-request log line is
+  suppressed for Notion URLs because those URLs contain block ids.
+
+The Notion backend has no `student_id` yet, so its run traces record
+`student_id: null`.
 
 ## Agent Loop
 
@@ -148,6 +211,26 @@ Optionally specify a model:
 export ANTHROPIC_MODEL="your-model-name"
 ```
 
+For the `local` profile only, also set the Notion variables (the `example`
+profile doesn't need them):
+
+```bash
+export NOTION_API_KEY="your-notion-integration-token"
+export NOTION_PARENT_PAGE_ID="your-students-parent-page-id"
+```
+
+Optionally override the Notion API version (default `2026-03-11`) or the
+block traversal depth limit (default `6`):
+
+```bash
+export NOTION_VERSION="2026-03-11"
+export NOTION_MAX_TRAVERSAL_DEPTH="6"
+```
+
+The Notion integration must be shared with the parent page so it can read the
+student pages beneath it. Don't set `STUDENT_CONTEXT_BACKEND` yourself:
+`run.py` sets it for each profile.
+
 ## Running the Agent
 
 Run the agent through `run.py`, which selects a configuration **profile** and
@@ -164,10 +247,12 @@ python3 run.py local
   `Jordan`, that transcript, and session date/time
   `September 8, 2026 11:00 AM ET`.
 * **`local`** — a private, gitignored configuration for real use:
-  `prompts/local/`, `data/students.local.json`, `references/local/`, and a
-  transcript of your choosing (conventionally under `fixtures/private/`).
-  There are no defaults for this profile — the student, transcript, and
-  session date/time must all be supplied explicitly:
+  `prompts/local/`, `references/local/`, student context from Notion (see
+  [Notion backend](#notion-backend-read-only)), and a transcript of your
+  choosing (conventionally under `fixtures/private/`). There are no defaults
+  for this profile — the student, transcript, and session date/time must all
+  be supplied explicitly, and `NOTION_API_KEY` and `NOTION_PARENT_PAGE_ID`
+  must be exported in your shell:
 
   ```bash
   python3 run.py local \
@@ -186,27 +271,30 @@ python3 run.py local
   precedence over the environment variable when both are set.
 
 `run.py` resolves and validates a profile's required files — including the
-transcript — before making any API call, and it never modifies
-`ANTHROPIC_API_KEY` or `ANTHROPIC_MODEL` — those always come from your
-shell's environment.
+transcript — and, for the Notion backend, checks that the required `NOTION_*`
+variables are set (it prints only their names) before making any API call. It
+never modifies `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, or `NOTION_*` — those
+always come from your shell's environment.
 
 You can still run `python3 main.py` directly; it uses the same environment
 variables (`PROMPTS_DIR`, `STUDENTS_DATA_PATH`, `REFERENCE_ROOT`,
-`TRANSCRIPT_PATH`, `MENTOR_STUDENT_NAME`, `SESSION_DATETIME`) and falls back
-to the public example defaults when they're unset.
+`STUDENT_CONTEXT_BACKEND`, `TRANSCRIPT_PATH`, `MENTOR_STUDENT_NAME`,
+`SESSION_DATETIME`) and falls back to the public example defaults when
+they're unset.
 
 Running the program may make paid Anthropic API requests.
 
 ### Local files are gitignored
 
-`prompts/local/`, `references/local/`, `data/students.local.json`, and
-`fixtures/private/` are excluded from version control (see `.gitignore`).
+`prompts/local/`, `references/local/`, `data/students.local.json` (no longer
+used by the `local` profile, which reads Notion), and `fixtures/private/` are
+excluded from version control (see `.gitignore`).
 They don't exist in a fresh checkout — create them yourself before running
 `python3 run.py local`. This keeps any real student data, transcripts, or
 proprietary reference material out of the repository while still letting the
 same codebase run against them locally.
 
-Each student record should include a stable, non-identifying `student_id`
+For the JSON backend, each student record should include a stable, non-identifying `student_id`
 (e.g. `"student_id": "student_007"`). It is used only to tag run traces in
 `logs/agent-runs.jsonl` and is removed from the context returned to the
 model. Records without one still run; their traces record `student_id: null`.
@@ -219,7 +307,7 @@ Any committed fixtures are sanitized, fictional, or composited examples.
 
 ## Current Limitations
 
-* Student context is retrieved from local mock data rather than Notion or other local database.
+* Notion access is read-only; there are no retries, and Notion-backed runs record `student_id: null`.
 * Path retrieval returns the complete reference guide, which increases token usage.
 * Outputs are generated as drafts and are not written back to Notion.
 * Tool errors and retry behavior are still being developed.

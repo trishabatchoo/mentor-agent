@@ -11,11 +11,13 @@ Selects a configuration profile (public synthetic example, or private
 local setup) and runs the agent with that profile's prompts, student
 data, reference material, transcript, and session date/time.
 
-This launcher never reads or sets secrets. ANTHROPIC_API_KEY and
-ANTHROPIC_MODEL continue to come from the parent shell environment
-untouched -- only the profile's own configuration variables
-(PROMPTS_DIR, STUDENTS_DATA_PATH, REFERENCE_ROOT, TRANSCRIPT_PATH,
-MENTOR_STUDENT_NAME, SESSION_DATETIME) are set here.
+This launcher never sets secrets. ANTHROPIC_API_KEY, ANTHROPIC_MODEL,
+and the NOTION_* variables continue to come from the parent shell
+environment untouched -- only the profile's own configuration variables
+(PROMPTS_DIR, STUDENTS_DATA_PATH, REFERENCE_ROOT, STUDENT_CONTEXT_BACKEND,
+TRANSCRIPT_PATH, MENTOR_STUDENT_NAME, SESSION_DATETIME) are set here. For
+the Notion backend it checks only that the required NOTION_* variables are
+present; their values are never printed.
 """
 
 import argparse
@@ -31,19 +33,30 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 # explicitly for it (see resolve_student_name). The transcript and
 # session date/time similarly default only for 'example' (see
 # resolve_transcript_path / resolve_session_datetime).
+#
+# "STUDENT_CONTEXT_BACKEND" selects where student context and session notes
+# come from. Only the "json" backend uses STUDENTS_DATA_PATH, so profiles
+# using "notion" don't define it.
 PROFILES = {
     "example": {
         "PROMPTS_DIR": "prompts/example",
         "STUDENTS_DATA_PATH": "data/students.example.json",
         "REFERENCE_ROOT": "references/example",
+        "STUDENT_CONTEXT_BACKEND": "json",
         "default_student": "Jordan",
     },
     "local": {
         "PROMPTS_DIR": "prompts/local",
-        "STUDENTS_DATA_PATH": "data/students.local.json",
         "REFERENCE_ROOT": "references/local",
+        "STUDENT_CONTEXT_BACKEND": "notion",
         "default_student": None,
     },
+}
+
+# Environment variables each backend needs. Checked for presence only.
+BACKEND_REQUIRED_ENV = {
+    "json": (),
+    "notion": ("NOTION_API_KEY", "NOTION_PARENT_PAGE_ID"),
 }
 
 REQUIRED_PROMPT_FILES = (
@@ -68,8 +81,10 @@ def parse_args(argv=None):
         epilog=(
             "Profiles:\n"
             "  example   public synthetic data (default student: Jordan)\n"
-            "  local     private local configuration (student, transcript,\n"
-            "            and session date/time all required)\n"
+            "  local     private local configuration, student context from\n"
+            "            Notion (student, transcript, and session date/time\n"
+            "            all required; NOTION_API_KEY and NOTION_PARENT_PAGE_ID\n"
+            "            must be set)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -212,9 +227,10 @@ def validate_profile_files(profile_name, transcript_path):
         if not path.is_file():
             missing.append(str(path))
 
-    students_path = PROJECT_DIR / profile["STUDENTS_DATA_PATH"]
-    if not students_path.is_file():
-        missing.append(str(students_path))
+    if "STUDENTS_DATA_PATH" in profile:
+        students_path = PROJECT_DIR / profile["STUDENTS_DATA_PATH"]
+        if not students_path.is_file():
+            missing.append(str(students_path))
 
     reference_index = PROJECT_DIR / profile["REFERENCE_ROOT"] / "path_index.json"
     if not reference_index.is_file():
@@ -226,21 +242,34 @@ def validate_profile_files(profile_name, transcript_path):
     return missing
 
 
+def missing_backend_env(profile_name, env):
+    """Return the names of environment variables the profile's backend
+    requires but that are unset or empty. Values are never returned."""
+    backend = PROFILES[profile_name]["STUDENT_CONTEXT_BACKEND"]
+    return [name for name in BACKEND_REQUIRED_ENV[backend] if not env.get(name)]
+
+
 def apply_profile_env(profile_name, student_name, transcript_path, session_datetime, env=None):
     """Write a run's resolved configuration into `env` (defaults to the
     real process environment, os.environ).
 
-    Only the six configuration keys below are set. Everything else
-    already present in `env` -- notably ANTHROPIC_API_KEY and
-    ANTHROPIC_MODEL inherited from the parent shell -- is left untouched.
+    Only the configuration keys below are set. STUDENTS_DATA_PATH is set
+    for profiles that define it and removed for those that don't, so a
+    stale value inherited from the shell can't apply. Everything else
+    already present in `env` -- notably ANTHROPIC_API_KEY, ANTHROPIC_MODEL,
+    and NOTION_* inherited from the parent shell -- is left untouched.
     """
     if env is None:
         env = os.environ
 
     profile = PROFILES[profile_name]
     env["PROMPTS_DIR"] = str(PROJECT_DIR / profile["PROMPTS_DIR"])
-    env["STUDENTS_DATA_PATH"] = str(PROJECT_DIR / profile["STUDENTS_DATA_PATH"])
+    if "STUDENTS_DATA_PATH" in profile:
+        env["STUDENTS_DATA_PATH"] = str(PROJECT_DIR / profile["STUDENTS_DATA_PATH"])
+    else:
+        env.pop("STUDENTS_DATA_PATH", None)
     env["REFERENCE_ROOT"] = str(PROJECT_DIR / profile["REFERENCE_ROOT"])
+    env["STUDENT_CONTEXT_BACKEND"] = profile["STUDENT_CONTEXT_BACKEND"]
     env["TRANSCRIPT_PATH"] = str(transcript_path)
     env["MENTOR_STUDENT_NAME"] = student_name
     env["SESSION_DATETIME"] = session_datetime
@@ -267,10 +296,21 @@ def main(argv=None):
             print(f"  - {path}", file=sys.stderr)
         raise SystemExit(1)
 
+    missing_env = missing_backend_env(args.profile, os.environ)
+    if missing_env:
+        print(
+            f"error: profile '{args.profile}' requires these environment "
+            "variables to be set:",
+            file=sys.stderr,
+        )
+        for name in missing_env:
+            print(f"  - {name}", file=sys.stderr)
+        raise SystemExit(1)
+
     # Configuration must land in the real process environment before
     # main.py (and, transitively, prompts.py / tools.py) is imported:
-    # those modules read PROMPTS_DIR / STUDENTS_DATA_PATH / REFERENCE_ROOT
-    # at import time, not at call time.
+    # those modules read PROMPTS_DIR / STUDENTS_DATA_PATH / REFERENCE_ROOT /
+    # STUDENT_CONTEXT_BACKEND at import time, not at call time.
     apply_profile_env(args.profile, student_name, transcript_path, session_datetime)
 
     import main as app_main

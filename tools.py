@@ -1,17 +1,30 @@
 """Tool schemas and implementations for the mentor agent.
 
-Two tools are exposed to the model: `get_student_context` (student record
-lookup) and `get_path_context` (learning-path reference retrieval). They
-are kept separate because the second call depends on data returned by the
-first -- the model reads a student's path from get_student_context, then
-requests that path's guide from get_path_context.
+Three tools are exposed to the model: `get_student_context` (student record
+lookup), `get_latest_session_notes` (the most recent previous session's
+notes), and `get_path_context` (learning-path reference retrieval). The
+path tool is separate because it depends on data returned by the first --
+the model reads a student's path from get_student_context, then requests
+that path's guide from get_path_context.
+
+Student context and session notes come from a backend selected explicitly
+by STUDENT_CONTEXT_BACKEND: "json" (a local student file; the default and
+the public example) or "notion" (read-only Notion pages). The backend is
+never inferred from which credentials happen to be set, and a failing
+Notion backend never falls back to the JSON file.
 """
 
 import json
 import os
 from pathlib import Path
 
+from notion_repository import NotionStudentRepository
+
 PROJECT_DIR = Path(__file__).parent
+
+BACKENDS = ("json", "notion")
+
+STUDENT_CONTEXT_BACKEND = os.environ.get("STUDENT_CONTEXT_BACKEND", "json")
 
 STUDENTS_PATH = Path(
     os.environ.get("STUDENTS_DATA_PATH", PROJECT_DIR / "data" / "students.example.json")
@@ -57,6 +70,25 @@ TOOLS = [
         }
     },
     {
+        "name": "get_latest_session_notes",
+        "description": (
+            "Get the notes from the student's most recent previous mentoring "
+            "session, with the session's date/time when available. Returns "
+            "latest_session as null when no previous session is recorded. "
+            "Never includes session transcripts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The name of the student."
+                },
+            },
+            "required": ["name"],
+        }
+    },
+    {
         "name": "get_path_context",
         "description": (
             "Retrieve the complete reference guide for a student's learning path. "
@@ -77,12 +109,42 @@ TOOLS = [
 ]
 
 
-def get_student_context(name: str) -> dict | None:
-    """Look up a student's stored context by name, or None if not found.
+_notion_repository: NotionStudentRepository | None = None
 
-    The record's student_id is a tracing identifier, not context for the
-    model, so it is removed from a copy of the record before returning.
+
+def student_context_backend() -> str:
+    """Return the configured backend, rejecting anything unrecognized."""
+    if STUDENT_CONTEXT_BACKEND not in BACKENDS:
+        raise ValueError(
+            "STUDENT_CONTEXT_BACKEND must be one of: " + ", ".join(BACKENDS)
+        )
+    return STUDENT_CONTEXT_BACKEND
+
+
+def get_notion_repository() -> NotionStudentRepository:
+    """Create the Notion repository on first use, from the environment.
+
+    Lazy so that importing this module never requires Notion settings.
     """
+    global _notion_repository
+    if _notion_repository is None:
+        _notion_repository = NotionStudentRepository.from_env()
+    return _notion_repository
+
+
+def get_student_context(name: str) -> dict | None:
+    """Look up a student's stored context by name.
+
+    JSON backend: the stored record, or None if not found. The record's
+    student_id is a tracing identifier, not context for the model, so it
+    is removed from a copy of the record before returning.
+
+    Notion backend: title, profile_text, path, and current_project. A
+    missing or ambiguous student raises rather than returning None.
+    """
+    if student_context_backend() == "notion":
+        return get_notion_repository().get_student_context(name)
+
     students = load_students()
     record = students.get(name.strip())
     if record is None:
@@ -96,13 +158,36 @@ def get_student_id(name: str) -> str | None:
     """Return the explicit, non-identifying student_id stored in a
     student's record, or None if the student or the field is missing.
 
-    Used only to tag run traces; never derived from the name.
+    Used only to tag run traces; never derived from the name. The Notion
+    backend has no student_id yet, so it always returns None.
     """
+    if student_context_backend() == "notion":
+        return None
+
     record = load_students().get(name.strip())
     if not isinstance(record, dict):
         return None
     student_id = record.get("student_id")
     return student_id if isinstance(student_id, str) and student_id else None
+
+
+def get_latest_session_notes(name: str) -> dict | None:
+    """Return the student's most recent previous session notes.
+
+    JSON backend: {"latest_session": <the record's previous_session or
+    None>}, or None if the student is not found.
+
+    Notion backend: {"latest_session": {title, session_datetime,
+    notes_source, notes}} or {"latest_session": None} when the student has
+    no session pages. Transcripts are never retrieved.
+    """
+    if student_context_backend() == "notion":
+        return get_notion_repository().get_latest_session_notes(name)
+
+    record = load_students().get(name.strip())
+    if record is None:
+        return None
+    return {"latest_session": record.get("previous_session")}
 
 
 def get_path_context(path: str) -> dict[str, str]:
@@ -131,6 +216,9 @@ def execute_tool(tool_name: str, tool_input: dict) -> dict | None:
     """Dispatch a tool_use request by name to its implementation."""
     if tool_name == "get_student_context":
         return get_student_context(tool_input["name"])
+
+    if tool_name == "get_latest_session_notes":
+        return get_latest_session_notes(tool_input["name"])
 
     if tool_name == "get_path_context":
         return get_path_context(tool_input["path"])
