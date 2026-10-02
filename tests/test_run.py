@@ -41,7 +41,16 @@ class EnvironmentIsolationMixin:
         "PROMPTS_DIR",
         "STUDENTS_DATA_PATH",
         "REFERENCE_ROOT",
+        "STUDENT_CONTEXT_BACKEND",
+        "NOTION_API_KEY",
+        "NOTION_PARENT_PAGE_ID",
     )
+
+    # Placeholder Notion settings for tests that run the 'local' profile
+    # past its environment check. Never used to contact Notion.
+    def set_placeholder_notion_env(self):
+        os.environ["NOTION_API_KEY"] = "placeholder-notion-key"
+        os.environ["NOTION_PARENT_PAGE_ID"] = "placeholder-parent-page"
 
     def setUp(self):
         super().setUp()
@@ -253,6 +262,7 @@ class ApplyProfileEnvTests(unittest.TestCase):
             env["STUDENTS_DATA_PATH"].endswith("data/students.example.json")
         )
         self.assertTrue(env["REFERENCE_ROOT"].endswith("references/example"))
+        self.assertEqual(env["STUDENT_CONTEXT_BACKEND"], "json")
         self.assertEqual(env["TRANSCRIPT_PATH"], str(transcript_path))
         self.assertEqual(env["SESSION_DATETIME"], run.DEFAULT_SESSION_DATETIME)
         # Parent-shell secrets and unrelated vars must survive untouched.
@@ -268,9 +278,10 @@ class ApplyProfileEnvTests(unittest.TestCase):
 
         self.assertEqual(env["MENTOR_STUDENT_NAME"], "Amya")
         self.assertTrue(env["PROMPTS_DIR"].endswith("prompts/local"))
-        self.assertTrue(
-            env["STUDENTS_DATA_PATH"].endswith("data/students.local.json")
-        )
+        # The local profile reads student context from Notion, so it has
+        # no student data file (intentional change from the JSON setup).
+        self.assertNotIn("STUDENTS_DATA_PATH", env)
+        self.assertEqual(env["STUDENT_CONTEXT_BACKEND"], "notion")
         self.assertTrue(env["REFERENCE_ROOT"].endswith("references/local"))
         self.assertEqual(env["TRANSCRIPT_PATH"], str(transcript_path))
         self.assertEqual(env["SESSION_DATETIME"], "September 8, 2026 11:00 AM ET")
@@ -313,6 +324,7 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
         # ValidateProfileFilesTests, so it's stubbed out here to isolate
         # CLI-override propagation.
         calls = self._install_fake_app_main()
+        self.set_placeholder_notion_env()
         with unittest.mock.patch.object(run, "validate_profile_files", return_value=[]):
             run.main(
                 [
@@ -338,6 +350,7 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
         os.environ["MENTOR_STUDENT_NAME"] = "Priya"
         os.environ["TRANSCRIPT_PATH"] = "fixtures/private/priya.txt"
         os.environ["SESSION_DATETIME"] = "September 9, 2026 3:00 PM ET"
+        self.set_placeholder_notion_env()
         with unittest.mock.patch.object(run, "validate_profile_files", return_value=[]):
             run.main(["local"])
         seen_env = calls[0]
@@ -410,6 +423,86 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
 
         self.assertEqual(calls[0]["ANTHROPIC_API_KEY"], "test-api-key-sentinel")
         self.assertEqual(calls[0]["ANTHROPIC_MODEL"], "model-sentinel")
+
+
+class BackendSelectionTests(unittest.TestCase):
+    def test_profiles_select_backends_explicitly(self):
+        self.assertEqual(run.PROFILES["example"]["STUDENT_CONTEXT_BACKEND"], "json")
+        self.assertEqual(run.PROFILES["local"]["STUDENT_CONTEXT_BACKEND"], "notion")
+
+    def test_example_profile_keeps_its_student_data_file(self):
+        self.assertEqual(
+            run.PROFILES["example"]["STUDENTS_DATA_PATH"], "data/students.example.json"
+        )
+        self.assertNotIn("STUDENTS_DATA_PATH", run.PROFILES["local"])
+
+    def test_local_does_not_require_a_student_data_file(self):
+        transcript_path = run.PROJECT_DIR / "fixtures/private/does-not-exist.txt"
+        missing = run.validate_profile_files("local", transcript_path)
+        self.assertFalse(any("students" in entry for entry in missing))
+
+    def test_example_needs_no_notion_environment(self):
+        self.assertEqual(run.missing_backend_env("example", {}), [])
+
+    def test_local_reports_missing_notion_variable_names(self):
+        self.assertEqual(
+            run.missing_backend_env("local", {}),
+            ["NOTION_API_KEY", "NOTION_PARENT_PAGE_ID"],
+        )
+        self.assertEqual(
+            run.missing_backend_env(
+                "local", {"NOTION_API_KEY": "k", "NOTION_PARENT_PAGE_ID": ""}
+            ),
+            ["NOTION_PARENT_PAGE_ID"],
+        )
+        self.assertEqual(
+            run.missing_backend_env(
+                "local", {"NOTION_API_KEY": "k", "NOTION_PARENT_PAGE_ID": "p"}
+            ),
+            [],
+        )
+
+    def test_local_removes_stale_inherited_students_path(self):
+        env = {"STUDENTS_DATA_PATH": "/stale/students.json"}
+        run.apply_profile_env("local", "Amya", Path("/t.txt"), "now", env)
+        self.assertNotIn("STUDENTS_DATA_PATH", env)
+
+    def test_apply_profile_env_leaves_notion_settings_untouched(self):
+        env = {"NOTION_API_KEY": "SENTINEL-NOTION-KEY", "NOTION_VERSION": "v"}
+        run.apply_profile_env("local", "Amya", Path("/t.txt"), "now", env)
+        self.assertEqual(env["NOTION_API_KEY"], "SENTINEL-NOTION-KEY")
+        self.assertEqual(env["NOTION_VERSION"], "v")
+
+
+class BackendEnvEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
+    def test_missing_notion_env_exits_before_touching_app(self):
+        calls = []
+        fake_module = types.ModuleType("main")
+        fake_module.main = lambda: calls.append(True)
+        sys.modules["main"] = fake_module
+        # Only the parent page id is missing; the key's value must never
+        # be echoed in the error output.
+        os.environ["NOTION_API_KEY"] = "SENTINEL-NOTION-KEY"
+        with unittest.mock.patch.object(run, "validate_profile_files", return_value=[]):
+            with redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as ctx:
+                    run.main(
+                        [
+                            "local",
+                            "--student",
+                            "Amya",
+                            "--transcript",
+                            "fixtures/private/amya.txt",
+                            "--session-datetime",
+                            "September 8, 2026 11:00 AM ET",
+                        ]
+                    )
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertEqual(calls, [])
+        output = stderr.getvalue()
+        self.assertIn("NOTION_PARENT_PAGE_ID", output)
+        self.assertNotIn("NOTION_API_KEY", output)
+        self.assertNotIn("SENTINEL-NOTION-KEY", output)
 
 
 if __name__ == "__main__":

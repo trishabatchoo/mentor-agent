@@ -14,9 +14,11 @@ Before generating the plan:
    * Relevant background or learning preferences, when available
    * Previous session topics and action items, when available
 
-2. Use the path-context tool to retrieve the reference guide for the student’s learning path.
+2. Use the latest-session-notes tool to retrieve the notes from the student’s most recent previous session. Retrieve both student context and latest-session notes before preparing the plan.
 
-3. Use the student’s current project to identify the relevant milestones, deliverables, and requirements within the path reference.
+3. Use the path-context tool to retrieve the reference guide for the student’s learning path.
+
+4. Use the student’s current project to identify the relevant milestones, deliverables, and requirements within the path reference.
 
 If previous session information or another required field is unavailable, state that limitation rather than inventing it.
 
