@@ -211,6 +211,26 @@ Optionally specify a model:
 export ANTHROPIC_MODEL="your-model-name"
 ```
 
+For the `local` profile only, also set the Notion variables (the `example`
+profile doesn't need them):
+
+```bash
+export NOTION_API_KEY="your-notion-integration-token"
+export NOTION_PARENT_PAGE_ID="your-students-parent-page-id"
+```
+
+Optionally override the Notion API version (default `2026-03-11`) or the
+block traversal depth limit (default `6`):
+
+```bash
+export NOTION_VERSION="2026-03-11"
+export NOTION_MAX_TRAVERSAL_DEPTH="6"
+```
+
+The Notion integration must be shared with the parent page so it can read the
+student pages beneath it. Don't set `STUDENT_CONTEXT_BACKEND` yourself:
+`run.py` sets it for each profile.
+
 ## Running the Agent
 
 Run the agent through `run.py`, which selects a configuration **profile** and
