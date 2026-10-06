@@ -3,8 +3,8 @@
 
 Usage:
     python3 run.py example
-    python3 run.py local --student Amya \
-        --transcript fixtures/private/amya-september-8.txt \
+    python3 run.py local --student Casey \
+        --transcript fixtures/private/session-2026-09-08.txt \
         --session-datetime "September 8, 2026 11:00 AM ET"
 
 Selects a configuration profile (public synthetic example, or private

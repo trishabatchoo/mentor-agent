@@ -11,6 +11,28 @@ exception messages, and secrets have no field to land in.
 
 Tracing never interferes with a run: a failure to write the trace file is
 reported once as a terminal warning and otherwise ignored.
+
+Event layers. Each layer reports its own boundary, so one run can be
+reconstructed without storing private content:
+
+    run_started ... run_completed / run_failed   overall agent run
+    model_response                                one Messages API call
+    tool_execution                                one agent tool call
+    notion_retrieval                              one repository retrieval
+                                                  (lookup + interpretation)
+    notion_request                                one logical Notion API
+                                                  operation (all its pages)
+
+A failure is reported once per layer it crosses. A Notion 5xx during a
+tool call yields notion_request:error, notion_retrieval:error,
+tool_execution:error, then run_failed. A failure raised by the repository
+itself (student not found, ambiguous match, traversal depth) has no
+notion_request error -- every request it made succeeded.
+
+Notion events are written while the tool runs, so they precede the
+tool_execution event of the same call; they carry its turn and
+tool_use_id for correlation. The Notion layer never sees those values:
+notion_observer() adds them when forwarding.
 """
 
 import hashlib
@@ -67,6 +89,59 @@ EVENT_FIELDS = {
     ),
     "run_completed": _RUN_TOTAL_FIELDS,
     "run_failed": _RUN_TOTAL_FIELDS + ("error_type", "failure_reason"),
+    "notion_request": (
+        "turn",
+        "tool_use_id",
+        "operation",
+        "duration_ms",
+        "status",
+        "status_category",
+        "request_count",
+        "pages_fetched",
+        "results_returned",
+        "error_type",
+    ),
+    "notion_retrieval": (
+        "turn",
+        "tool_use_id",
+        "retrieval_type",
+        "duration_ms",
+        "status",
+        "requests_made",
+        "pages_fetched",
+        "blocks_examined",
+        "maximum_depth_reached",
+        "cache_hit",
+        "path_found",
+        "project_found",
+        "session_found",
+        "notes_source",
+        "notes_char_count",
+        "error_type",
+    ),
+}
+
+NOTION_EVENTS = frozenset({"notion_request", "notion_retrieval"})
+
+# Notion events arrive from outside this module, so their string fields are
+# checked too: enumerated fields must hold a listed value, error_type must
+# look like a class name, and every other field (except the tool_use_id this
+# module adds itself) must not be a string at all. Failing values become null.
+_NOTION_FIELD_VALUES = {
+    "notion_request": {
+        "operation": frozenset({"search_pages", "list_block_children"}),
+        "status": frozenset({"success", "error"}),
+        "status_category": frozenset(
+            {"2xx", "4xx", "5xx", "transport_error", "malformed_response"}
+        ),
+    },
+    "notion_retrieval": {
+        "retrieval_type": frozenset({"student_context", "latest_session_notes"}),
+        "status": frozenset(
+            {"success", "not_found", "ambiguous", "no_session", "error"}
+        ),
+        "notes_source": frozenset({"notes_branch", "page", "none"}),
+    },
 }
 
 _SCALAR_TYPES = (str, int, float, bool, type(None))
@@ -74,6 +149,18 @@ _SCALAR_TYPES = (str, int, float, bool, type(None))
 
 def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 3)
+
+
+def _notion_value(event: str, key: str, value):
+    """`value` if it is allowed in this Notion event field, else None."""
+    allowed = _NOTION_FIELD_VALUES[event].get(key)
+    if allowed is not None:
+        return value if isinstance(value, str) and value in allowed else None
+    if key == "error_type":
+        return value if isinstance(value, str) and value.isidentifier() else None
+    if key == "tool_use_id":
+        return value if isinstance(value, str) else None
+    return None if isinstance(value, str) else value
 
 
 def text_sha256(text: str) -> str:
@@ -156,6 +243,36 @@ class RunTracer:
             duration_ms=duration_ms,
             status="error" if error_type else "success",
             error_type=error_type,
+        )
+
+    def notion_observer(self, turn: int, tool_use_id: str):
+        """Return an observer for one tool call's Notion retrieval.
+
+        It forwards Notion events to this run's trace, tagged with `turn`
+        and `tool_use_id`. Create one per tool call; it holds no state
+        beyond these values and this tracer.
+        """
+
+        def observe(event: str, fields: dict) -> None:
+            if isinstance(fields, dict):
+                self.notion_event(
+                    event, {**fields, "turn": turn, "tool_use_id": tool_use_id}
+                )
+
+        return observe
+
+    def notion_event(self, event: str, fields: dict) -> None:
+        """Record a notion_request or notion_retrieval event. Other event
+        names are dropped, as are fields outside the event's allowlist."""
+        if event not in NOTION_EVENTS or not isinstance(fields, dict):
+            return
+        self._emit(
+            event,
+            **{
+                key: _notion_value(event, key, fields[key])
+                for key in EVENT_FIELDS[event]
+                if key in fields
+            },
         )
 
     def mark_failure(self, reason: str) -> None:

@@ -12,12 +12,17 @@ by STUDENT_CONTEXT_BACKEND: "json" (a local student file; the default and
 the public example) or "notion" (read-only Notion pages). The backend is
 never inferred from which credentials happen to be set, and a failing
 Notion backend never falls back to the JSON file.
+
+The student tools accept an optional `observer` that is forwarded, per
+call, to the Notion backend for metadata-only retrieval events (see
+notion_client.NotionObserver). The JSON backend ignores it.
 """
 
 import json
 import os
 from pathlib import Path
 
+from notion_client import NotionObserver
 from notion_repository import NotionStudentRepository
 
 PROJECT_DIR = Path(__file__).parent
@@ -125,6 +130,9 @@ def get_notion_repository() -> NotionStudentRepository:
     """Create the Notion repository on first use, from the environment.
 
     Lazy so that importing this module never requires Notion settings.
+    The repository is shared by every later call in the process, so
+    per-run state (such as a tracing observer) is passed per call and
+    never attached to it.
     """
     global _notion_repository
     if _notion_repository is None:
@@ -132,7 +140,9 @@ def get_notion_repository() -> NotionStudentRepository:
     return _notion_repository
 
 
-def get_student_context(name: str) -> dict | None:
+def get_student_context(
+    name: str, observer: NotionObserver | None = None
+) -> dict | None:
     """Look up a student's stored context by name.
 
     JSON backend: the stored record, or None if not found. The record's
@@ -143,7 +153,7 @@ def get_student_context(name: str) -> dict | None:
     missing or ambiguous student raises rather than returning None.
     """
     if student_context_backend() == "notion":
-        return get_notion_repository().get_student_context(name)
+        return get_notion_repository().get_student_context(name, observer=observer)
 
     students = load_students()
     record = students.get(name.strip())
@@ -171,7 +181,9 @@ def get_student_id(name: str) -> str | None:
     return student_id if isinstance(student_id, str) and student_id else None
 
 
-def get_latest_session_notes(name: str) -> dict | None:
+def get_latest_session_notes(
+    name: str, observer: NotionObserver | None = None
+) -> dict | None:
     """Return the student's most recent previous session notes.
 
     JSON backend: {"latest_session": <the record's previous_session or
@@ -182,7 +194,7 @@ def get_latest_session_notes(name: str) -> dict | None:
     no session pages. Transcripts are never retrieved.
     """
     if student_context_backend() == "notion":
-        return get_notion_repository().get_latest_session_notes(name)
+        return get_notion_repository().get_latest_session_notes(name, observer=observer)
 
     record = load_students().get(name.strip())
     if record is None:
@@ -212,13 +224,19 @@ def get_path_context(path: str) -> dict[str, str]:
     }
 
 
-def execute_tool(tool_name: str, tool_input: dict) -> dict | None:
-    """Dispatch a tool_use request by name to its implementation."""
+def execute_tool(
+    tool_name: str, tool_input: dict, observer: NotionObserver | None = None
+) -> dict | None:
+    """Dispatch a tool_use request by name to its implementation.
+
+    `observer`, if given, receives Notion retrieval events for this call
+    only (Notion backend only).
+    """
     if tool_name == "get_student_context":
-        return get_student_context(tool_input["name"])
+        return get_student_context(tool_input["name"], observer)
 
     if tool_name == "get_latest_session_notes":
-        return get_latest_session_notes(tool_input["name"])
+        return get_latest_session_notes(tool_input["name"], observer)
 
     if tool_name == "get_path_context":
         return get_path_context(tool_input["path"])

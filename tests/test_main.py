@@ -157,5 +157,73 @@ class EndToEndTraceTests(MainTestCase):
                 self.assertNotIn(private, log_output)
 
 
+class LoggingConfigurationTests(unittest.TestCase):
+    """LOG_LEVEL=DEBUG must not let the real Anthropic SDK log request
+    bodies. The SDK runs for real against an offline mock transport."""
+
+    def setUp(self):
+        root = logging.getLogger()
+        saved_root = (root.level, list(root.handlers))
+        saved_levels = {
+            name: logging.getLogger(name).level for name in main.THIRD_PARTY_LOGGERS
+        }
+
+        def restore():
+            root.setLevel(saved_root[0])
+            root.handlers[:] = saved_root[1]
+            for name, level in saved_levels.items():
+                logging.getLogger(name).setLevel(level)
+
+        self.addCleanup(restore)
+        # basicConfig only applies its level to a root logger with no handlers.
+        root.handlers[:] = []
+
+    def test_debug_level_does_not_log_sdk_request_bodies(self):
+        import anthropic
+        import httpx2
+
+        def respond(request):
+            return httpx2.Response(
+                200,
+                json={
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "test-model",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        stream = io.StringIO()
+        main.configure_logging("DEBUG")
+        logging.getLogger().addHandler(logging.StreamHandler(stream))
+        logging.getLogger("main").debug("project debug record")
+
+        client = anthropic.Anthropic(
+            api_key="placeholder-key-for-offline-tests",
+            http_client=httpx2.Client(transport=httpx2.MockTransport(respond)),
+        )
+        client.messages.create(
+            model="test-model",
+            max_tokens=10,
+            system="SENTINEL-SYSTEM-PROMPT",
+            messages=[{"role": "user", "content": "SENTINEL-TRANSCRIPT-TEXT"}],
+        )
+
+        output = stream.getvalue()
+        self.assertIn("project debug record", output)
+        self.assertNotIn("SENTINEL-SYSTEM-PROMPT", output)
+        self.assertNotIn("SENTINEL-TRANSCRIPT-TEXT", output)
+
+    def test_quieter_levels_are_kept_for_third_party_loggers(self):
+        main.configure_logging("WARNING")
+        for name in main.THIRD_PARTY_LOGGERS:
+            with self.subTest(logger=name):
+                self.assertEqual(logging.getLogger(name).level, logging.WARNING)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -77,8 +77,10 @@ def tab(block_id):
 
 
 class FakeNotion:
-    def __init__(self, page_size=100):
+    def __init__(self, page_size=100, cursor_prefix=""):
         self.page_size = page_size
+        # Prepended to every next_cursor, so tests can plant a marker in it.
+        self.cursor_prefix = cursor_prefix
         self.search_results: list[dict] = []
         self.children: dict[str, list[dict]] = {}
         self.requests: list[httpx2.Request] = []
@@ -127,7 +129,7 @@ class FakeNotion:
         else:
             return httpx2.Response(405, json={"object": "error"})
 
-        start = int(cursor) if cursor else 0
+        start = int(cursor[len(self.cursor_prefix):]) if cursor else 0
         end = start + self.page_size
         has_more = end < len(items)
         return httpx2.Response(
@@ -136,6 +138,6 @@ class FakeNotion:
                 "object": "list",
                 "results": items[start:end],
                 "has_more": has_more,
-                "next_cursor": str(end) if has_more else None,
+                "next_cursor": f"{self.cursor_prefix}{end}" if has_more else None,
             },
         )

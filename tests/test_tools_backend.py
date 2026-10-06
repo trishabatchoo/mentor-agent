@@ -166,8 +166,10 @@ class NotionBackendTests(unittest.TestCase):
             tools.execute_tool("get_latest_session_notes", {"name": "Casey"}),
             {"latest_session": None},
         )
-        self.repository.get_student_context.assert_called_once_with("Casey")
-        self.repository.get_latest_session_notes.assert_called_once_with("Casey")
+        self.repository.get_student_context.assert_called_once_with("Casey", observer=None)
+        self.repository.get_latest_session_notes.assert_called_once_with(
+            "Casey", observer=None
+        )
 
     def test_student_id_is_none(self):
         self.assertIsNone(tools.get_student_id("Casey"))
