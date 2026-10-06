@@ -177,9 +177,17 @@ def _run_loop(
                         sorted(block.input) if isinstance(block.input, dict) else [],
                     )
 
+                    # Scoped to this run and tool call: Notion events are
+                    # tagged with this turn and tool_use_id by the tracer,
+                    # so the Notion layer never sees either.
+                    observer = tracer.notion_observer(
+                        turn=turn + 1, tool_use_id=block.id
+                    )
                     tool_start = time.perf_counter()
                     try:
-                        result = execute_tool(block.name, block.input)
+                        result = execute_tool(
+                            block.name, block.input, observer=observer
+                        )
                     except Exception as exc:
                         tracer.tool_execution(
                             turn=turn + 1,

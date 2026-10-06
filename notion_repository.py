@@ -8,6 +8,20 @@ Page and block ids stay inside this module: results returned to callers
 (and, through tools.py, to the model) contain only titles, text, and
 parsed fields. Logs carry only counts, flags, durations, and exception
 class names; exception messages are fixed text.
+
+Observability: the public operations accept an optional per-call
+`observer` (see notion_client.NotionObserver). It receives the client's
+notion_request events, then exactly one notion_retrieval summary per call,
+whatever the outcome. Summaries hold counts, flags, fixed status values,
+and exception class names -- never names, titles, text, datetimes, ids,
+or queries. The observer is never stored on the repository, so a cached
+repository cannot carry one caller's observer into another's call.
+
+Caching: resolved student pages are cached in `_resolved` for the
+lifetime of the repository, which tools.py keeps for the lifetime of the
+process. That suits the CLI, where each invocation is a fresh process; a
+long-lived service would need per-run scoping or invalidation, since a
+renamed or moved student page would otherwise stay resolved to its old id.
 """
 
 import logging
@@ -23,6 +37,8 @@ from notion_client import (
     NotionClient,
     NotionConfigError,
     NotionError,
+    NotionObserver,
+    notify_observer,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +124,73 @@ class _Node:
 
 def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 3)
+
+
+class _RetrievalStats:
+    """Counters for one repository call, created per call and never stored.
+
+    Also serves as the observer handed to the client: it tallies the
+    client's notion_request events and forwards them to the caller's
+    observer, if there is one.
+    """
+
+    def __init__(self, observer: NotionObserver | None):
+        self._observer = observer
+        self.requests_made = 0
+        self.pages_fetched = 0
+        self.blocks_examined = 0
+        self.maximum_depth_reached: int | None = None
+        self.cache_hit: bool | None = None
+        self.session_found: bool | None = None
+
+    def __call__(self, event: str, fields: dict) -> None:
+        if event == "notion_request":
+            self.requests_made += fields["request_count"]
+            self.pages_fetched += fields["pages_fetched"]
+        notify_observer(self._observer, event, fields)
+
+    def listing_at(self, depth: int) -> None:
+        if self.maximum_depth_reached is None or depth > self.maximum_depth_reached:
+            self.maximum_depth_reached = depth
+
+    def finish(
+        self,
+        retrieval_type: str,
+        start: float,
+        status: str,
+        exc: Exception | None = None,
+        **outcome,
+    ) -> None:
+        """Send the notion_retrieval summary. `outcome` sets the
+        retrieval-specific fields; the rest stay None."""
+        if self._observer is None:
+            return
+        fields = {
+            "retrieval_type": retrieval_type,
+            "duration_ms": _elapsed_ms(start),
+            "status": status,
+            "requests_made": self.requests_made,
+            "pages_fetched": self.pages_fetched,
+            "blocks_examined": self.blocks_examined,
+            "maximum_depth_reached": self.maximum_depth_reached,
+            "cache_hit": self.cache_hit,
+            "path_found": None,
+            "project_found": None,
+            "session_found": self.session_found,
+            "notes_source": None,
+            "notes_char_count": None,
+            "error_type": type(exc).__name__ if exc is not None else None,
+        }
+        fields.update(outcome)
+        notify_observer(self._observer, "notion_retrieval", fields)
+
+
+def _failure_status(exc: Exception) -> str:
+    if isinstance(exc, StudentNotFoundError):
+        return "not_found"
+    if isinstance(exc, AmbiguousStudentMatchError):
+        return "ambiguous"
+    return "error"
 
 
 def normalize_title(text: str) -> str:
@@ -280,7 +363,8 @@ class NotionStudentRepository:
         self._client = client
         self._parent_id = parent
         self.max_traversal_depth = max_traversal_depth
-        # normalized student name -> (page id, page title)
+        # normalized student name -> (page id, page title). Lives as long as
+        # the repository; see "Caching" in the module docstring.
         self._resolved: dict[str, tuple[str, str]] = {}
 
     def __repr__(self) -> str:
@@ -298,14 +382,16 @@ class NotionStudentRepository:
 
     # -- public operations ------------------------------------------------
 
-    def get_student_context(self, name: str) -> dict:
+    def get_student_context(
+        self, name: str, *, observer: NotionObserver | None = None
+    ) -> dict:
         """Return the student's page title, readable profile text, and the
         parsed Path and Current project values (None when absent)."""
         start = time.perf_counter()
+        stats = _RetrievalStats(observer)
         try:
-            page_id, title = self._resolve_student_page(name)
-            block_count = [0]
-            nodes = self._fetch_children(page_id, 0, block_count)
+            page_id, title = self._resolve_student_page(name, stats)
+            nodes = self._fetch_children(page_id, 0, stats)
             raw_lines = list(_raw_text_lines(nodes))
             context = {
                 "title": title,
@@ -315,25 +401,37 @@ class NotionStudentRepository:
             }
         except Exception as exc:
             self._log_failure("get_student_context", start, exc)
+            stats.finish("student_context", start, _failure_status(exc), exc)
             raise
         logger.info(
             "Notion op=get_student_context status=success blocks=%d "
             "path_found=%s current_project_found=%s duration_ms=%s",
-            block_count[0],
+            stats.blocks_examined,
             context["path"] is not None,
             context["current_project"] is not None,
             _elapsed_ms(start),
         )
+        stats.finish(
+            "student_context",
+            start,
+            "success",
+            path_found=context["path"] is not None,
+            project_found=context["current_project"] is not None,
+        )
         return context
 
-    def get_latest_session_notes(self, name: str) -> dict:
+    def get_latest_session_notes(
+        self, name: str, *, observer: NotionObserver | None = None
+    ) -> dict:
         """Return the most recent session's title, datetime, and notes, or
         {"latest_session": None} when the student has no session pages."""
         start = time.perf_counter()
+        stats = _RetrievalStats(observer)
         try:
-            result, block_count = self._latest_session_notes(name)
+            result = self._latest_session_notes(name, stats)
         except Exception as exc:
             self._log_failure("get_latest_session_notes", start, exc)
+            stats.finish("latest_session_notes", start, _failure_status(exc), exc)
             raise
         session = result["latest_session"]
         logger.info(
@@ -342,18 +440,30 @@ class NotionStudentRepository:
             session is not None,
             bool(session and session["notes"]),
             session["notes_source"] if session else None,
-            block_count,
+            stats.blocks_examined,
             _elapsed_ms(start),
         )
+        if session is None:
+            stats.finish("latest_session_notes", start, "no_session", notes_source="none")
+        else:
+            stats.finish(
+                "latest_session_notes",
+                start,
+                "success",
+                notes_source=session["notes_source"],
+                notes_char_count=len(session["notes"]),
+            )
         return result
 
     # -- internals --------------------------------------------------------
 
-    def _latest_session_notes(self, name: str) -> tuple[dict, int]:
-        page_id, _ = self._resolve_student_page(name)
+    def _latest_session_notes(self, name: str, stats: _RetrievalStats) -> dict:
+        page_id, _ = self._resolve_student_page(name, stats)
 
         sessions = []
-        top_level = self._client.list_block_children(page_id)
+        stats.listing_at(0)
+        top_level = self._client.list_block_children(page_id, observer=stats)
+        stats.blocks_examined += len(top_level)
         for block in top_level:
             if _block_type(block) != "child_page":
                 continue
@@ -368,15 +478,15 @@ class NotionStudentRepository:
             len(sessions),
             len(top_level),
         )
+        stats.session_found = bool(sessions)
         if not sessions:
-            return {"latest_session": None}, len(top_level)
+            return {"latest_session": None}
 
         # max() keeps the first of equal datetimes, so ties resolve to
         # document order rather than to anything arbitrary.
         session_datetime, title, session_id = max(sessions, key=lambda s: s[0])
 
-        block_count = [len(top_level)]
-        nodes = self._fetch_children(session_id, 0, block_count)
+        nodes = self._fetch_children(session_id, 0, stats)
         notes_branch = _find_notes_branch(nodes)
         if notes_branch is not None:
             content, source = notes_branch.children, "notes_branch"
@@ -390,16 +500,17 @@ class NotionStudentRepository:
                 "notes_source": source,
                 "notes": "\n".join(_render(content, [])),
             }
-        }, block_count[0]
+        }
 
-    def _resolve_student_page(self, name: str) -> tuple[str, str]:
+    def _resolve_student_page(self, name: str, stats: _RetrievalStats) -> tuple[str, str]:
         target = normalize_title(name) if isinstance(name, str) else ""
         if not target:
             raise StudentNotFoundError("A student name is required.")
-        if target in self._resolved:
+        stats.cache_hit = target in self._resolved
+        if stats.cache_hit:
             return self._resolved[target]
 
-        results = self._client.search_pages(name.strip())
+        results = self._client.search_pages(name.strip(), observer=stats)
         matches: dict[str, tuple[str, str]] = {}
         for page in results:
             if page.get("object") != "page":
@@ -440,7 +551,7 @@ class NotionStudentRepository:
         self._resolved[target] = resolved
         return resolved
 
-    def _fetch_children(self, parent_id: str, depth: int, block_count: list[int]) -> list[_Node]:
+    def _fetch_children(self, parent_id: str, depth: int, stats: _RetrievalStats) -> list[_Node]:
         """Fetch a block's descendants in document order.
 
         `depth` is the nesting level of the blocks being fetched (a page's
@@ -453,15 +564,16 @@ class NotionStudentRepository:
                 f"Notion block nesting exceeded the traversal depth limit "
                 f"({self.max_traversal_depth})."
             )
+        stats.listing_at(depth)
         nodes = []
-        for block in self._client.list_block_children(parent_id):
+        for block in self._client.list_block_children(parent_id, observer=stats):
             block_type = _block_type(block)
-            block_count[0] += 1
+            stats.blocks_examined += 1
             if _block_label(block) == TRANSCRIPT_LABEL:
                 continue
             children = []
             if block_type not in _NON_TRAVERSED_TYPES and block.get("has_children") is True:
-                children = self._fetch_children(_block_id(block), depth + 1, block_count)
+                children = self._fetch_children(_block_id(block), depth + 1, stats)
             nodes.append(_Node(block, children))
         return nodes
 

@@ -9,10 +9,21 @@ messages. Log records carry only the operation name, HTTP status category,
 duration, and page/item counts. Errors are raised with `from None` so the
 underlying httpx2 exception -- whose message includes the request URL -- is
 not shown in tracebacks.
+
+Observability: each public read operation accepts an optional `observer`,
+a callable that receives one `notion_request` event per completed logical
+operation (however many result pages it took). The observer is passed per
+call and never stored, so this module stays independent of any agent or
+tracing code. Event fields are built here from fixed operation names,
+counts, durations, status categories, and exception class names only --
+never queries, ids, cursors, URLs, headers, response bodies, or exception
+messages. A failing observer is ignored and never affects the operation.
 """
 
 import logging
 import time
+from dataclasses import dataclass
+from typing import Callable
 
 import httpx2
 
@@ -26,6 +37,14 @@ PAGE_SIZE = 100
 # Upper bound on pages fetched for one paginated listing, so a misbehaving
 # cursor can't loop forever.
 DEFAULT_MAX_PAGES = 50
+
+# Receives (event_name, fields). Fields are metadata only; see module docstring.
+NotionObserver = Callable[[str, dict], None]
+
+# status_category values an observer may receive; anything else is None.
+REQUEST_STATUS_CATEGORIES = frozenset(
+    {"2xx", "4xx", "5xx", "transport_error", "malformed_response"}
+)
 
 
 class NotionError(Exception):
@@ -85,6 +104,28 @@ def _status_category(status_code: int) -> str:
     return f"{status_code // 100}xx"
 
 
+def notify_observer(observer: NotionObserver | None, event: str, fields: dict) -> None:
+    """Send an event to `observer`, if any. Observer failures are logged by
+    class name only and otherwise ignored: observability never changes the
+    outcome of a Notion operation."""
+    if observer is None:
+        return
+    try:
+        observer(event, fields)
+    except Exception as exc:
+        logger.debug("Notion observer failed (%s); ignored.", type(exc).__name__)
+
+
+@dataclass
+class _OperationStats:
+    """Counters for one logical (possibly paginated) read operation."""
+
+    request_count: int = 0
+    pages_fetched: int = 0
+    # Category of the last HTTP response received, if any.
+    status_category: str | None = None
+
+
 class NotionClient:
     """Authenticated, read-only access to the Notion REST API."""
 
@@ -119,7 +160,9 @@ class NotionClient:
 
     # -- public read operations -----------------------------------------
 
-    def search_pages(self, query: str) -> list[dict]:
+    def search_pages(
+        self, query: str, *, observer: NotionObserver | None = None
+    ) -> list[dict]:
         """Return every page result of a Notion title search, across all
         result pages. Notion's search is fuzzy; callers must filter."""
         body = {
@@ -128,20 +171,23 @@ class NotionClient:
             "page_size": PAGE_SIZE,
         }
 
-        def fetch(cursor):
+        def fetch(cursor, stats):
             page_body = dict(body)
             if cursor:
                 page_body["start_cursor"] = cursor
-            return self._request("POST", "/search", "search", json=page_body)
+            return self._request("POST", "/search", "search", stats, json=page_body)
 
-        return self._paginate("search", fetch)
+        def run(stats):
+            return self._paginate("search", fetch, stats)
 
-    def list_block_children(self, block_id: str) -> list[dict]:
+        return self._observed("search_pages", run, observer)
+
+    def list_block_children(
+        self, block_id: str, *, observer: NotionObserver | None = None
+    ) -> list[dict]:
         """Return every direct child block of a page or block, in order."""
-        if not isinstance(block_id, str) or not block_id:
-            raise MalformedNotionResponseError("A Notion block id was missing.")
 
-        def fetch(cursor):
+        def fetch(cursor, stats):
             params = {"page_size": PAGE_SIZE}
             if cursor:
                 params["start_cursor"] = cursor
@@ -149,15 +195,71 @@ class NotionClient:
                 "GET",
                 f"/blocks/{block_id}/children",
                 "list_block_children",
+                stats,
                 params=params,
             )
 
-        return self._paginate("list_block_children", fetch)
+        def run(stats):
+            if not isinstance(block_id, str) or not block_id:
+                raise MalformedNotionResponseError("A Notion block id was missing.")
+            return self._paginate("list_block_children", fetch, stats)
+
+        return self._observed("list_block_children", run, observer)
 
     # -- internals ------------------------------------------------------
 
-    def _request(self, method: str, path: str, operation: str, **kwargs) -> dict:
+    def _observed(self, operation: str, run, observer: NotionObserver | None) -> list[dict]:
+        """Run one logical operation and report it as a single
+        notion_request event. Exceptions are re-raised unchanged."""
         start = time.perf_counter()
+        stats = _OperationStats()
+        try:
+            results = run(stats)
+        except Exception as exc:
+            if stats.request_count == 0:
+                category = None
+            elif isinstance(exc, NotionRequestError):
+                category = exc.status_category
+            elif isinstance(exc, MalformedNotionResponseError):
+                category = "malformed_response"
+            else:
+                # e.g. PaginationLimitExceededError: every response succeeded,
+                # so the category stays that of the last response (2xx).
+                category = stats.status_category
+            self._notify_request(
+                observer, operation, start, stats, "error", category, None, exc
+            )
+            raise
+        self._notify_request(
+            observer, operation, start, stats, "success",
+            stats.status_category, len(results), None,
+        )
+        return results
+
+    @staticmethod
+    def _notify_request(
+        observer, operation, start, stats, status, category, results_returned, exc
+    ) -> None:
+        if observer is None:
+            return
+        notify_observer(observer, "notion_request", {
+            "operation": operation,
+            "duration_ms": _elapsed_ms(start),
+            "status": status,
+            "status_category": (
+                category if category in REQUEST_STATUS_CATEGORIES else None
+            ),
+            "request_count": stats.request_count,
+            "pages_fetched": stats.pages_fetched,
+            "results_returned": results_returned,
+            "error_type": type(exc).__name__ if exc is not None else None,
+        })
+
+    def _request(
+        self, method: str, path: str, operation: str, stats: _OperationStats, **kwargs
+    ) -> dict:
+        start = time.perf_counter()
+        stats.request_count += 1
         try:
             response = self._http.request(method, path, **kwargs)
         except httpx2.HTTPError as exc:
@@ -170,6 +272,7 @@ class NotionClient:
             raise NotionRequestError(operation, "transport_error") from None
 
         category = _status_category(response.status_code)
+        stats.status_category = category
         logger.info(
             "Notion request op=%s status=%s duration_ms=%s",
             operation,
@@ -191,7 +294,7 @@ class NotionClient:
             )
         return data
 
-    def _paginate(self, operation: str, fetch) -> list[dict]:
+    def _paginate(self, operation: str, fetch, stats: _OperationStats) -> list[dict]:
         results: list[dict] = []
         cursor = None
         seen_cursors = set()
@@ -201,7 +304,7 @@ class NotionClient:
                 raise PaginationLimitExceededError(
                     f"Notion {operation} exceeded {self.max_pages} result pages."
                 )
-            data = fetch(cursor)
+            data = fetch(cursor, stats)
             pages += 1
 
             page_results = data.get("results")
@@ -215,6 +318,7 @@ class NotionClient:
                     f"Notion {operation} response contained a non-object result."
                 )
             results.extend(page_results)
+            stats.pages_fetched += 1
 
             if not has_more:
                 break

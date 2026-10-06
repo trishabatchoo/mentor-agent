@@ -10,7 +10,7 @@ This is an early working baseline.
 
 The agent currently:
 
-* Supports pre-session and post-session modes
+* Supports pre-session, post-session, and new-student modes in `run_agent()`; the command-line entry points (`run.py`, `main.py`) run post-session only
 * Loads shared and mode-specific instructions
 * Accepts runtime information such as a student name, transcript, and session date
 * Uses an agent loop that can handle multiple tool calls
@@ -172,6 +172,78 @@ fields are `null` outside `post_session` mode.
 Tracing never changes a run's outcome: if the log file can't be written, a
 single warning is emitted and the run continues.
 
+### Observability is not evaluation
+
+Traces describe what a run did: its latency, token usage, tool calls, Notion
+requests, and how it failed. They say nothing about whether the output was
+correct, grounded, or useful. Judging output quality is evaluation, which is
+separate work and not part of this milestone.
+
+### true, false, and null
+
+`true` and `false` are recorded only when the value was actually determined.
+Every allowlisted field is always present, and `null` means one of:
+
+* **Not applicable to this event:** for example, transcript fields outside
+  `post_session`, `path_found`/`project_found` on a `latest_session_notes`
+  retrieval, or `session_found` on a `student_context` retrieval.
+* **Not reached because of an earlier failure:** for example, `cache_hit`
+  when the student name was blank, `results_returned` on a failed request, or
+  `status_category` when no request was sent.
+* **Not available:** `student_id` when the record has none (always, for the
+  Notion backend), or `stop_reason` when the API returned none.
+* **Rejected by the allowlist:** a value that wasn't a plain scalar, or a
+  Notion field value outside its fixed set, is written as `null` rather than
+  dropped.
+
+`notes_source: "none"` is different from `null`: it means the lookup ran and
+the student had no session pages. On those events `notes_char_count` is
+`null`; a session whose notes are empty records `0`.
+
+### Notion retrieval events
+
+With the Notion backend, two more event types are written to the same file,
+with the same `run_id`, plus the `turn` and `tool_use_id` of the tool call
+that triggered them. The JSON backend writes neither.
+
+| Event | Layer | Records |
+|---|---|---|
+| `notion_request` | One logical Notion API operation (`search_pages` or `list_block_children`), however many result pages it took | duration, `success`/`error`, `status_category` (`2xx`, `4xx`, `5xx`, `transport_error`, `malformed_response`, or `null`), request and page counts, results returned, error type |
+| `notion_retrieval` | One repository retrieval (`student_context` or `latest_session_notes`): page lookup plus interpretation | duration, status (`success`, `not_found`, `ambiguous`, `no_session`, `error`), requests and pages fetched, blocks examined, deepest nesting level listed, `cache_hit`, whether a path / current project / session was found, `notes_source` (`notes_branch`, `page`, `none`), notes character count, error type |
+
+Together with the existing events, each layer reports its own boundary:
+`notion_request` is the interaction with the Notion API, `notion_retrieval`
+is the repository's lookup and interpretation, `tool_execution` is the agent
+tool boundary, and `run_completed`/`run_failed` is the whole run. A failure
+is reported once per layer it crosses. For example, a Notion 5xx yields
+`notion_request:error`, `notion_retrieval:error`, `tool_execution:error`, and
+`run_failed`. A failure raised by the repository itself (student not found,
+ambiguous match, traversal depth) has no `notion_request` error, because every
+request it made succeeded. A pagination-limit failure keeps
+`status_category: "2xx"` with `error_type: "PaginationLimitExceededError"`:
+the API answered successfully, and the application's safety limit stopped it.
+
+Notion events are written while the tool runs, so they appear just before the
+`tool_execution` event of the same call:
+
+```bash
+jq -c 'select(.run_id == "YOUR_RUN_ID" and .tool_use_id == "YOUR_TOOL_USE_ID")' \
+  logs/agent-runs.jsonl
+```
+
+These events never contain student names, search queries, page titles,
+retrieved text, session datetimes, Notion ids, cursors, URLs, file paths, or
+exception messages. The Notion modules don't depend on the tracer. The agent
+passes each tool call a fresh observer, and the Notion layer reports
+metadata-only events to it without knowing the run, turn, or tool call.
+Standalone repository calls without an observer record nothing.
+
+Resolved student pages are cached for the lifetime of the process, so a
+second lookup of the same student shows `cache_hit: true` and no
+`search_pages` request. This suits the CLI, where each invocation is a fresh
+process. A long-lived service would need per-run scoping or invalidation of
+that cache.
+
 The examples below require [`jq`](https://jqlang.org/).
 
 ```bash
@@ -185,6 +257,8 @@ jq 'select(.run_id == "YOUR_RUN_ID")' logs/agent-runs.jsonl
 ```
 
 ## Setup
+
+Requires Python 3.10 or later (developed on 3.14).
 
 Create and activate a virtual environment:
 
@@ -256,8 +330,8 @@ python3 run.py local
 
   ```bash
   python3 run.py local \
-    --student Amya \
-    --transcript fixtures/private/amya-september-8.txt \
+    --student Casey \
+    --transcript fixtures/private/session-2026-09-08.txt \
     --session-datetime "September 8, 2026 11:00 AM ET"
   ```
 
@@ -283,6 +357,50 @@ variables (`PROMPTS_DIR`, `STUDENTS_DATA_PATH`, `REFERENCE_ROOT`,
 they're unset.
 
 Running the program may make paid Anthropic API requests.
+
+### Terminal output
+
+Terminal logs default to `INFO`. Set `LOG_LEVEL=DEBUG` for more detail (tool-use
+ids, tool input field names, response metadata). Third-party HTTP loggers
+(`anthropic`, `httpx2`, `httpcore2`) are never set below `INFO`, because at
+`DEBUG` the Anthropic SDK logs full request bodies.
+
+The terminal is not held to the same rules as the trace file:
+
+* The final model response is printed to stdout. That is the program's
+  output, and it can contain student information.
+* An unhandled error prints a Python traceback, whose exception message may
+  include a file path or an API error message.
+* `run.py` prints the paths of missing files, so name private transcripts by
+  session date (as above), not by student name.
+
+## Running the Tests
+
+The test suite runs offline. It makes no Anthropic or Notion calls and needs
+no API keys:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+## Troubleshooting
+
+* **`KeyError: 'ANTHROPIC_API_KEY'` on startup:** export `ANTHROPIC_API_KEY`
+  (see [Setup](#setup)). `agent.py` reads it at import time.
+* **`profile 'local' is missing required files`:** create the gitignored
+  `prompts/local/` and `references/local/` files and the transcript (see
+  [Local files are gitignored](#local-files-are-gitignored)).
+* **`profile 'local' requires these environment variables`:** export
+  `NOTION_API_KEY` and `NOTION_PARENT_PAGE_ID`.
+* **`StudentNotFoundError` / `AmbiguousStudentMatchError`:** exactly one page
+  directly under `NOTION_PARENT_PAGE_ID` must have a title matching the
+  student name (case and spacing are ignored), and the integration must be
+  shared with that parent page.
+* **`Run trace could not be written`:** `logs/` isn't writable. The run still
+  completes, without a trace.
+* **`Claude reached max_tokens` / `Agent did not finish within 5 turns`:** the
+  run failed and is recorded as `run_failed` with `failure_reason`
+  `max_tokens` or `max_turns`.
 
 ### Local files are gitignored
 

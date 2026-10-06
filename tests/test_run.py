@@ -83,16 +83,16 @@ class ParseArgsTests(unittest.TestCase):
             [
                 "local",
                 "--student",
-                "Amya",
+                "Casey",
                 "--transcript",
-                "fixtures/private/amya-september-8.txt",
+                "fixtures/private/session-2026-09-08.txt",
                 "--session-datetime",
                 "September 8, 2026 11:00 AM ET",
             ]
         )
         self.assertEqual(args.profile, "local")
-        self.assertEqual(args.student, "Amya")
-        self.assertEqual(args.transcript, "fixtures/private/amya-september-8.txt")
+        self.assertEqual(args.student, "Casey")
+        self.assertEqual(args.transcript, "fixtures/private/session-2026-09-08.txt")
         self.assertEqual(args.session_datetime, "September 8, 2026 11:00 AM ET")
 
     def test_unknown_profile_exits_nonzero_with_usage(self):
@@ -131,8 +131,8 @@ class StudentNamePrecedenceTests(unittest.TestCase):
             run.resolve_student_name("local", None, {})
 
     def test_local_accepts_env_var(self):
-        env = {"MENTOR_STUDENT_NAME": "Amya"}
-        self.assertEqual(run.resolve_student_name("local", None, env), "Amya")
+        env = {"MENTOR_STUDENT_NAME": "Casey"}
+        self.assertEqual(run.resolve_student_name("local", None, env), "Casey")
 
     def test_local_error_message_is_actionable(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -167,18 +167,18 @@ class TranscriptPathPrecedenceTests(unittest.TestCase):
         self.assertIn("TRANSCRIPT_PATH", message)
 
     def test_local_accepts_env_var(self):
-        env = {"TRANSCRIPT_PATH": "fixtures/private/amya.txt"}
+        env = {"TRANSCRIPT_PATH": "fixtures/private/session.txt"}
         resolved = run.resolve_transcript_path("local", None, env)
-        self.assertEqual(resolved, run.PROJECT_DIR / "fixtures/private/amya.txt")
+        self.assertEqual(resolved, run.PROJECT_DIR / "fixtures/private/session.txt")
 
     def test_relative_cli_path_resolved_against_project_dir(self):
         resolved = run.resolve_transcript_path(
-            "local", "fixtures/private/amya-september-8.txt", {}
+            "local", "fixtures/private/session-2026-09-08.txt", {}
         )
         self.assertTrue(resolved.is_absolute())
         self.assertEqual(
             resolved,
-            run.PROJECT_DIR / "fixtures/private/amya-september-8.txt",
+            run.PROJECT_DIR / "fixtures/private/session-2026-09-08.txt",
         )
 
     def test_absolute_cli_path_used_unmodified(self):
@@ -271,12 +271,12 @@ class ApplyProfileEnvTests(unittest.TestCase):
 
     def test_local_profile_sets_expected_keys(self):
         env = {}
-        transcript_path = run.PROJECT_DIR / "fixtures/private/amya.txt"
+        transcript_path = run.PROJECT_DIR / "fixtures/private/session.txt"
         run.apply_profile_env(
-            "local", "Amya", transcript_path, "September 8, 2026 11:00 AM ET", env
+            "local", "Casey", transcript_path, "September 8, 2026 11:00 AM ET", env
         )
 
-        self.assertEqual(env["MENTOR_STUDENT_NAME"], "Amya")
+        self.assertEqual(env["MENTOR_STUDENT_NAME"], "Casey")
         self.assertTrue(env["PROMPTS_DIR"].endswith("prompts/local"))
         # The local profile reads student context from Notion, so it has
         # no student data file (intentional change from the JSON setup).
@@ -330,18 +330,18 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
                 [
                     "local",
                     "--student",
-                    "Amya",
+                    "Casey",
                     "--transcript",
-                    "fixtures/private/amya-september-8.txt",
+                    "fixtures/private/session-2026-09-08.txt",
                     "--session-datetime",
                     "September 8, 2026 11:00 AM ET",
                 ]
             )
         seen_env = calls[0]
-        self.assertEqual(seen_env["MENTOR_STUDENT_NAME"], "Amya")
+        self.assertEqual(seen_env["MENTOR_STUDENT_NAME"], "Casey")
         self.assertEqual(
             seen_env["TRANSCRIPT_PATH"],
-            str(run.PROJECT_DIR / "fixtures/private/amya-september-8.txt"),
+            str(run.PROJECT_DIR / "fixtures/private/session-2026-09-08.txt"),
         )
         self.assertEqual(seen_env["SESSION_DATETIME"], "September 8, 2026 11:00 AM ET")
 
@@ -373,7 +373,7 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
         calls = self._install_fake_app_main()
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as ctx:
-                run.main(["local", "--student", "Amya"])
+                run.main(["local", "--student", "Casey"])
         self.assertNotEqual(ctx.exception.code, 0)
         self.assertEqual(calls, [])
 
@@ -385,9 +385,9 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
                     [
                         "local",
                         "--student",
-                        "Amya",
+                        "Casey",
                         "--transcript",
-                        "fixtures/private/amya-september-8.txt",
+                        "fixtures/private/session-2026-09-08.txt",
                     ]
                 )
         self.assertNotEqual(ctx.exception.code, 0)
@@ -404,7 +404,7 @@ class MainEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
                     [
                         "local",
                         "--student",
-                        "Amya",
+                        "Casey",
                         "--transcript",
                         "fixtures/private/definitely-does-not-exist-test-transcript.txt",
                         "--session-datetime",
@@ -464,12 +464,12 @@ class BackendSelectionTests(unittest.TestCase):
 
     def test_local_removes_stale_inherited_students_path(self):
         env = {"STUDENTS_DATA_PATH": "/stale/students.json"}
-        run.apply_profile_env("local", "Amya", Path("/t.txt"), "now", env)
+        run.apply_profile_env("local", "Casey", Path("/t.txt"), "now", env)
         self.assertNotIn("STUDENTS_DATA_PATH", env)
 
     def test_apply_profile_env_leaves_notion_settings_untouched(self):
         env = {"NOTION_API_KEY": "SENTINEL-NOTION-KEY", "NOTION_VERSION": "v"}
-        run.apply_profile_env("local", "Amya", Path("/t.txt"), "now", env)
+        run.apply_profile_env("local", "Casey", Path("/t.txt"), "now", env)
         self.assertEqual(env["NOTION_API_KEY"], "SENTINEL-NOTION-KEY")
         self.assertEqual(env["NOTION_VERSION"], "v")
 
@@ -490,9 +490,9 @@ class BackendEnvEndToEndTests(EnvironmentIsolationMixin, unittest.TestCase):
                         [
                             "local",
                             "--student",
-                            "Amya",
+                            "Casey",
                             "--transcript",
-                            "fixtures/private/amya.txt",
+                            "fixtures/private/session.txt",
                             "--session-datetime",
                             "September 8, 2026 11:00 AM ET",
                         ]
