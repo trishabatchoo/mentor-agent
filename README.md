@@ -1,6 +1,6 @@
 # Mentor Agent
 
-An exploratory agentic workflow for preparing for mentoring sessions and processing post-session transcripts.
+An exploratory agentic workflow for preparing for mentoring sessions and completing post-session admin.
 
 This project is an independent implementation of a mentoring workflow that previously ran inside Claude Desktop. The goal is to explore agent orchestration, tool use, grounding, observability, reliability, and evaluation using the Anthropic Messages API directly.
 
@@ -79,58 +79,44 @@ In this baseline version, the tool layer handles deterministic document selectio
 
 ## Student Context Backends
 
-`get_student_context` and `get_latest_session_notes` read from a backend chosen
-explicitly by `STUDENT_CONTEXT_BACKEND`, which `run.py` sets per profile. The
-backend is never inferred from which credentials happen to be set, and a
-failing Notion backend never falls back to the JSON file.
+The agent uses the backend selected by `STUDENT_CONTEXT_BACKEND`. `run.py`
+sets this explicitly for each profile; it is never inferred from available
+credentials, and Notion failures do not fall back to local JSON.
 
 | Profile | Backend | Source |
-|---|---|---|
-| `example` | `json` | `data/students.example.json` (`get_latest_session_notes` returns the record's `previous_session`) |
-| `local` | `notion` | Pages under `NOTION_PARENT_PAGE_ID`, read-only |
+| --- | --- | --- |
+| `example` | JSON | Synthetic records in `data/students.example.json` |
+| `local` | Notion | Student pages under `NOTION_PARENT_PAGE_ID` |
 
 ### Notion backend (read-only)
 
 Configuration comes from the environment, never from code:
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `NOTION_API_KEY` | yes | Integration token |
-| `NOTION_PARENT_PAGE_ID` | yes | Page whose child pages are the student pages |
-| `NOTION_VERSION` | no | API version header, default `2026-03-11` |
-| `NOTION_MAX_TRAVERSAL_DEPTH` | no | Block nesting limit, default `6` |
+Required environment variables:
+
+- `NOTION_API_KEY`
+- `NOTION_PARENT_PAGE_ID`
+
+Optional configuration:
+
+- `NOTION_VERSION` — defaults to `2026-03-11`
+- `NOTION_MAX_TRAVERSAL_DEPTH` — defaults to `6`
+
+Student pages are resolved by an exact normalized title match beneath the
+configured parent page. Missing or ambiguous matches fail explicitly rather
+than using fuzzy results.
 
 Behavior:
 
-* **Student page:** searches Notion by name, then requires exactly one page
-  whose title matches case-insensitively (whitespace-collapsed) and whose
-  parent is `NOTION_PARENT_PAGE_ID`. No match or multiple matches raise
-  `StudentNotFoundError` / `AmbiguousStudentMatchError`; fuzzy results are
-  never used.
-* **Student context:** the page's blocks rendered as text in document order
-  (headings, paragraphs, list items, to-dos, child-page titles, and nested
-  blocks), plus `path` and `current_project` parsed from lines such as
-  `Path: ...` and `Current project: ...` (`null` when absent). Child pages
-  (sessions) are not entered.
-* **Latest session:** the student page's child pages whose titles are
-  timezone-aware ISO timestamps (e.g. `2026-09-29T11:00:00.000-04:00`); the
-  latest by parsed datetime wins. Other titles, date-only and timezone-less
-  timestamps are ignored. No sessions yields `latest_session: null`.
-* **Session notes:** if the session contains a block labelled exactly `Notes`
-  (e.g. a tab), only its contents are returned; otherwise the whole page is.
-  Any block labelled `Transcript` is skipped without fetching its contents.
-  Nesting beyond the depth limit raises `TraversalDepthExceededError` rather
-  than truncating.
-* **Errors:** `NotionConfigError`, `NotionRequestError` (non-2xx or transport
-  failure; no retries), `MalformedNotionResponseError`, and the errors above.
-  Messages are fixed text with no names, ids, URLs, or content.
-* **Privacy:** Notion page and block ids are not included in tool results.
-  Terminal logs record only operation names, status categories, durations,
-  counts, and match/notes-found flags. The `httpx2` per-request log line is
-  suppressed for Notion URLs because those URLs contain block ids.
+- extracts the student’s path and current project;
+- identifies the latest session from timestamped child pages;
+- reads the `Notes` branch when present, or the session page otherwise;
+- skips transcript branches; and
+- returns privacy-safe errors without names, Notion identifiers, URLs, or
+  page content.
 
-The Notion backend has no `student_id` yet, so its run traces record
-`student_id: null`.
+Notion access is read-only. Page and block IDs are excluded from tool results
+and logs. Notion-backed runs currently record `student_id: null`.
 
 ## Agent Loop
 
@@ -147,81 +133,74 @@ On each turn, the loop:
 
 ## Observability
 
-In addition to the human-readable terminal logs, every valid agent run appends
-structured events to `logs/agent-runs.jsonl` (gitignored). The file uses JSONL
-(newline-delimited JSON): each line is one complete JSON object describing a
-single event. Calls rejected by argument validation are not traced. All events
-from a run share a `run_id`, plus `timestamp`, `mode`, and `model`.
+Every valid run writes structured events to
+`logs/agent-runs.jsonl`, alongside human-readable terminal logs. The file is
+gitignored and uses JSONL: one JSON event per line.
+
+Events from the same run share a `run_id`, allowing the full execution path
+to be reconstructed across model calls, tool use, and Notion retrieval.
 
 | Event | Records |
-|---|---|
-| `run_started` | `student_id`, `transcript_char_count`, `transcript_sha256` |
-| `model_response` | turn, call duration, `stop_reason`, input/output tokens |
-| `tool_execution` | turn, tool name, `tool_use_id`, duration, `success`/`error`, error type |
-| `run_completed` | total duration, turns, token totals, tool calls |
-| `run_failed` | total duration, turns, token totals, tool calls, error type, `failure_reason` (`api_error`, `tool_error`, `max_tokens`, `max_turns`, `unexpected_error`) |
+| --- | --- |
+| `run_started` | Pseudonymous student ID and transcript fingerprint metadata |
+| `model_response` | Turn, latency, stop reason, and token usage |
+| `tool_execution` | Tool name, tool-use ID, latency, status, and error type |
+| `notion_request` | Notion operation, request counts, latency, and status |
+| `notion_retrieval` | Retrieval type, cache use, blocks examined, and found/not-found flags |
+| `run_completed` | Total duration, turns, tokens, and tool calls |
+| `run_failed` | Run totals, error type, and failure category |
 
-Traces contain operational metadata only. Student names, transcript text or
-file paths, prompts, tool inputs and results, model responses, exception
-messages, and API keys are never recorded. Each event has a fixed allowlist of
-fields, so other data is dropped rather than written. `student_id` comes from
-the student record, and `transcript_sha256` is a fingerprint for telling
-whether two runs used the same transcript, not a security mechanism. Transcript
-fields are `null` outside `post_session` mode.
+### Privacy
 
-Tracing never changes a run's outcome: if the log file can't be written, a
-single warning is emitted and the run continues.
+Traces contain operational metadata, not the content being processed. They
+exclude student names, transcript text and paths, prompts, tool inputs and
+results, model responses, Notion IDs and URLs, exception messages, and API
+keys.
+
+Each event has a fixed allowlist of permitted fields. A pseudonymous
+`student_id` supports correlation, while the transcript character count and
+SHA-256 fingerprint help distinguish inputs without storing transcript text.
+The fingerprint is an identifier, not a security mechanism.
+
+Tracing is fail-open: if an event cannot be written, the application emits a
+warning and the agent run continues.
+
+### Reading trace values
+
+For optional fields:
+
+- `true` or `false` means the value was evaluated;
+- `null` means it was unavailable, not applicable, or not reached; and
+- values such as `notes_source: "none"` mean the lookup completed and found
+  no matching data.
+
+For example, `path_found` is `null` during a latest-session retrieval because
+that operation does not inspect the student’s path.
 
 ### Observability is not evaluation
 
-Traces describe what a run did: its latency, token usage, tool calls, Notion
-requests, and how it failed. They say nothing about whether the output was
-correct, grounded, or useful. Judging output quality is evaluation, which is
-separate work and not part of this milestone.
+Observability explains how a run behaved—its latency, token use, tool calls,
+retrievals, and failures. It does not determine whether the generated output
+was correct, grounded, or useful. Output-quality evaluation is planned as a
+separate layer.
 
-### true, false, and null
 
-`true` and `false` are recorded only when the value was actually determined.
-Every allowlisted field is always present, and `null` means one of:
-
-* **Not applicable to this event:** for example, transcript fields outside
-  `post_session`, `path_found`/`project_found` on a `latest_session_notes`
-  retrieval, or `session_found` on a `student_context` retrieval.
-* **Not reached because of an earlier failure:** for example, `cache_hit`
-  when the student name was blank, `results_returned` on a failed request, or
-  `status_category` when no request was sent.
-* **Not available:** `student_id` when the record has none (always, for the
-  Notion backend), or `stop_reason` when the API returned none.
-* **Rejected by the allowlist:** a value that wasn't a plain scalar, or a
-  Notion field value outside its fixed set, is written as `null` rather than
-  dropped.
-
-`notes_source: "none"` is different from `null`: it means the lookup ran and
-the student had no session pages. On those events `notes_char_count` is
-`null`; a session whose notes are empty records `0`.
 
 ### Notion retrieval events
 
-With the Notion backend, two more event types are written to the same file,
-with the same `run_id`, plus the `turn` and `tool_use_id` of the tool call
-that triggered them. The JSON backend writes neither.
+Notion-backed runs add two event types:
+- `notion_request` records an interaction with the Notion API, including its
+  latency, status category, pagination, and result counts.
+- `notion_retrieval` records the application-level lookup and interpretation,
+  such as resolving a student page or extracting the latest session notes.
 
-| Event | Layer | Records |
-|---|---|---|
-| `notion_request` | One logical Notion API operation (`search_pages` or `list_block_children`), however many result pages it took | duration, `success`/`error`, `status_category` (`2xx`, `4xx`, `5xx`, `transport_error`, `malformed_response`, or `null`), request and page counts, results returned, error type |
-| `notion_retrieval` | One repository retrieval (`student_context` or `latest_session_notes`): page lookup plus interpretation | duration, status (`success`, `not_found`, `ambiguous`, `no_session`, `error`), requests and pages fetched, blocks examined, deepest nesting level listed, `cache_hit`, whether a path / current project / session was found, `notes_source` (`notes_branch`, `page`, `none`), notes character count, error type |
+These events share the run’s `run_id` and the triggering tool call’s `turn`
+and `tool_use_id`. This makes it possible to follow one operation across the
+system’s layers:
 
-Together with the existing events, each layer reports its own boundary:
-`notion_request` is the interaction with the Notion API, `notion_retrieval`
-is the repository's lookup and interpretation, `tool_execution` is the agent
-tool boundary, and `run_completed`/`run_failed` is the whole run. A failure
-is reported once per layer it crosses. For example, a Notion 5xx yields
-`notion_request:error`, `notion_retrieval:error`, `tool_execution:error`, and
-`run_failed`. A failure raised by the repository itself (student not found,
-ambiguous match, traversal depth) has no `notion_request` error, because every
-request it made succeeded. A pagination-limit failure keeps
-`status_category: "2xx"` with `error_type: "PaginationLimitExceededError"`:
-the API answered successfully, and the application's safety limit stopped it.
+```text
+Notion request → repository retrieval → tool execution → agent run
+```
 
 Notion events are written while the tool runs, so they appear just before the
 `tool_execution` event of the same call:
@@ -231,18 +210,13 @@ jq -c 'select(.run_id == "YOUR_RUN_ID" and .tool_use_id == "YOUR_TOOL_USE_ID")' 
   logs/agent-runs.jsonl
 ```
 
-These events never contain student names, search queries, page titles,
-retrieved text, session datetimes, Notion ids, cursors, URLs, file paths, or
-exception messages. The Notion modules don't depend on the tracer. The agent
-passes each tool call a fresh observer, and the Notion layer reports
-metadata-only events to it without knowing the run, turn, or tool call.
-Standalone repository calls without an observer record nothing.
+Notion events contain metadata only and exclude identifying information,
+retrieved content, request details, and exception messages. Tracing is
+provided through an optional observer, keeping the Notion modules independent
+of the tracer.
 
-Resolved student pages are cached for the lifetime of the process, so a
-second lookup of the same student shows `cache_hit: true` and no
-`search_pages` request. This suits the CLI, where each invocation is a fresh
-process. A long-lived service would need per-run scoping or invalidation of
-that cache.
+Student-page resolutions are cached for the lifetime of each CLI process.
+A future long-lived service would require a bounded or request-scoped cache.
 
 The examples below require [`jq`](https://jqlang.org/).
 
@@ -305,50 +279,32 @@ The Notion integration must be shared with the parent page so it can read the
 student pages beneath it. Don't set `STUDENT_CONTEXT_BACKEND` yourself:
 `run.py` sets it for each profile.
 
-## Running the Agent
 
-Run the agent through `run.py`, which selects a configuration **profile** and
-sets its environment variables before starting the agent loop:
+## Running the agent
+
+Use `run.py` to select a configuration profile:
 
 ```bash
 python3 run.py example
-python3 run.py local
+python3 run.py local \
+  --student Casey \
+  --transcript fixtures/private/session-2026-09-08.txt \
+  --session-datetime "September 8, 2026 11:00 AM ET"
 ```
 
-* **`example`** — the public, synthetic configuration committed to this repo:
-  `prompts/example/`, `data/students.example.json`, `references/example/`,
-  and `fixtures/example/post_session_transcript.txt`. Defaults to student
-  `Jordan`, that transcript, and session date/time
-  `September 8, 2026 11:00 AM ET`.
-* **`local`** — a private, gitignored configuration for real use:
-  `prompts/local/`, `references/local/`, student context from Notion (see
-  [Notion backend](#notion-backend-read-only)), and a transcript of your
-  choosing (conventionally under `fixtures/private/`). There are no defaults
-  for this profile — the student, transcript, and session date/time must all
-  be supplied explicitly, and `NOTION_API_KEY` and `NOTION_PARENT_PAGE_ID`
-  must be exported in your shell:
+- `example` uses synthetic files in the repository and provides some
+  default inputs.
+- `local` uses private prompts, references, transcripts, and read-only Notion
+  context. It requires explicit student, transcript, session time,
+  `NOTION_API_KEY`, and `NOTION_PARENT_PAGE_ID`.
 
-  ```bash
-  python3 run.py local \
-    --student Casey \
-    --transcript fixtures/private/session-2026-09-08.txt \
-    --session-datetime "September 8, 2026 11:00 AM ET"
-  ```
 
-  `--transcript` may be a path relative to the project root (as above) or
-  an absolute path; relative paths are resolved against the project
-  directory regardless of your current working directory.
+Transcript paths may be absolute or relative to the project root. Inputs can
+also be supplied through `MENTOR_STUDENT_NAME`, `TRANSCRIPT_PATH`, and
+`SESSION_DATETIME`; command-line arguments take precedence.
 
-  Each of `--student`, `--transcript`, and `--session-datetime` can
-  instead be supplied via the environment (`MENTOR_STUDENT_NAME`,
-  `TRANSCRIPT_PATH`, `SESSION_DATETIME`); the CLI flag always takes
-  precedence over the environment variable when both are set.
-
-`run.py` resolves and validates a profile's required files — including the
-transcript — and, for the Notion backend, checks that the required `NOTION_*`
-variables are set (it prints only their names) before making any API call. It
-never modifies `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, or `NOTION_*` — those
-always come from your shell's environment.
+`run.py` validates required files and configuration before making API calls.
+Credentials and model settings are always read from the shell environment.
 
 You can still run `python3 main.py` directly; it uses the same environment
 variables (`PROMPTS_DIR`, `STUDENTS_DATA_PATH`, `REFERENCE_ROOT`,
@@ -360,10 +316,9 @@ Running the program may make paid Anthropic API requests.
 
 ### Terminal output
 
-Terminal logs default to `INFO`. Set `LOG_LEVEL=DEBUG` for more detail (tool-use
-ids, tool input field names, response metadata). Third-party HTTP loggers
-(`anthropic`, `httpx2`, `httpcore2`) are never set below `INFO`, because at
-`DEBUG` the Anthropic SDK logs full request bodies.
+Logs default to `INFO`. Use `LOG_LEVEL=DEBUG` for additional response and
+tool metadata. Third-party HTTP loggers remain at `INFO` because their debug
+output may include complete API request bodies.
 
 The terminal is not held to the same rules as the trace file:
 
@@ -402,20 +357,15 @@ python3 -m unittest discover -s tests
   run failed and is recorded as `run_failed` with `failure_reason`
   `max_tokens` or `max_turns`.
 
-### Local files are gitignored
+### Private local files
 
-`prompts/local/`, `references/local/`, `data/students.local.json` (no longer
-used by the `local` profile, which reads Notion), and `fixtures/private/` are
-excluded from version control (see `.gitignore`).
-They don't exist in a fresh checkout — create them yourself before running
-`python3 run.py local`. This keeps any real student data, transcripts, or
-proprietary reference material out of the repository while still letting the
-same codebase run against them locally.
+Private prompts, references, transcripts, and legacy local student data are
+gitignored and must be created locally when needed. This keeps sensitive or
+proprietary material out of the public repository.
 
-For the JSON backend, each student record should include a stable, non-identifying `student_id`
-(e.g. `"student_id": "student_007"`). It is used only to tag run traces in
-`logs/agent-runs.jsonl` and is removed from the context returned to the
-model. Records without one still run; their traces record `student_id: null`.
+JSON student records may include a stable, non-identifying `student_id` for
+trace correlation. It is not sent to the model; missing IDs are recorded as
+`null`.
 
 ## Privacy
 
